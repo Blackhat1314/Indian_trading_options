@@ -16,6 +16,7 @@ F6 ALERTS    price / % / RVOL / VWAP / ORB / OI / news / top-list alerts · one-
 F7 SYSTEM    health of every service · the ranker's own scorecard · walk-forward backtest · data-lake coverage
 F8 GEO       world map: live ships, chokepoints & ports, war/conflict events, refinery fires, military aircraft,
              satellite imagery · geo-risk index · oil & supply · India macro · market impact — every view switchable
+F9 ADMIN     pull the 5-year history from Dhan into the lake with one button · progress, quota, coverage per symbol
 ```
 
 It runs out of the box on a built-in **simulator** that emits byte-identical Dhan packets, so you can
@@ -68,7 +69,9 @@ python run.py --speed 20      # simulator at 20×: a full session in ~20 minutes
 # open http://localhost:8000
 ```
 
-`run.py` starts the four services (ingestor, analytics, geo, gateway), prefixes their logs and stops them all on Ctrl+C.
+`run.py` starts the services (ingestor, analytics, geo, gateway, and the backfill worker behind the ADMIN desk),
+prefixes their logs and stops them all on Ctrl+C. It rebuilds the UI by itself when the frontend sources are newer
+than the last build (e.g. after a `git pull`) and npm is installed.
 For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173).
 
 ---
@@ -97,8 +100,8 @@ For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173
    The first run takes about 3 minutes and ~750 of the 7,000 daily calls; later days ~400. Progress is
    on the SYSTEM desk (**Auto history**). If you start after 09:30 that day's picks can't be locked
    on time, so the Intraday desk shows a live ranking marked *provisional* and the day isn't scored.
-5. **Optional, for research**: the full 5-year archive (`backfill/backfill.py`, below) for the
-   walk-forward backtest. When the token expires (Dhan shows the validity when you generate it), paste a
+5. **Optional, for research**: the full 5-year archive for the walk-forward backtest — open the
+   **ADMIN desk (F9)** and press **Start pull** (below). When the token expires (Dhan shows the validity when you generate it), paste a
    fresh one into `.env` and restart the ingestor: `docker compose restart ingestor`.
 
 **Test the live path without an account or market hours**: `scripts/mock_dhan.py` is a local stand-in
@@ -111,15 +114,39 @@ the live system and the backfill), quotes 1/s, option chains 1 per 3 s per under
 
 ---
 
-## The 5-year backfill (separate tool, shared lake)
+## ADMIN desk (F9): pull the 5-year history
 
-`backfill/backfill.py` is deliberately separate from the live system. It writes plain Parquet files
+Open **F9 ADMIN**, choose what to pull (daily and/or 1-minute bars, 1–5 years, all F&O symbols or a list),
+check the preview — how many requests are still needed, how many calls are left today, how many days of
+quota it spans — and press **Start pull**. It runs wherever TradeDesk runs (your PC, a VPS, Docker), writes
+to that machine's lake, and the desk shows progress, the Dhan calls used today, every symbol's coverage and
+an activity log.
+
+The pull is done by the **backfill worker** (`python -m td.services.backfiller`, started by `run.py` and by
+`docker compose up`), a separate process, so it cannot slow down or crash the live desks:
+
+* **Paced**: 3 requests/s by default (Dhan allows 5/s in total), slowed to 1/s or paused in market hours
+  (09:00–15:40 IST, your choice), and it waits while the ingestor loads its own history (start-up and 08:40).
+* **Quota-safe**: it shares the 7,000-calls/day budget with the live app and keeps a reserve (1,000 by
+  default) for it. When the rest is used it waits and **resumes by itself after midnight IST**; 5 years of
+  1-minute bars for the whole F&O list is ~4,600 requests, so about a day and a half.
+* **Resumable**: what has been downloaded is remembered as date ranges (`data/backfill/state.json`), the job in
+  `data/backfill/job.json`. A restart, a redeploy or Stop + Start carries on where it left off; ranges already
+  in the lake are never fetched again.
+* **One at a time**: a Redis lock keeps the desk and `backfill/backfill.py` from pulling together.
+
+Access: with no `ACCESS_KEYS` (local use) the desk is open; on a shared gateway it is hidden unless you set
+`ADMIN_KEY` in `.env`, and then it asks for that key. Friends with access keys never see it otherwise.
+
+## The 5-year backfill CLI (same engine, shared lake)
+
+`backfill/backfill.py` is the same engine for scripts and cron, deliberately separate from the live system. It writes plain Parquet files
 (`data/lake/dhan/<interval>/<SYMBOL>.parquet`, columns `ts open high low close volume oi`) that the live
 analytics, the research scripts and anything else you build can read, with pandas, DuckDB or Polars.
 
 ```bash
 python backfill/backfill.py plan    --intervals D,1 --years 5        # how many calls / days of quota
-python backfill/backfill.py run     --intervals D,1 --years 5        # resumable (state in data/backfill/state.json)
+python backfill/backfill.py run     --intervals D,1 --years 5        # resumable across days (data/backfill/state.json)
 python backfill/backfill.py update                                   # incremental, run daily after close
 python backfill/backfill.py options --underlyings NIFTY,BANKNIFTY --strikes 2 --years 1   # rolling ATM±N options
 python backfill/backfill.py status                                   # coverage per interval
@@ -127,6 +154,8 @@ python backfill/backfill.py sim                                      # synthetic
 ```
 
 5- and 15-minute bars are resampled from 1-minute bars on the fly, so `D,1` is all you need.
+Daily bars take one request per symbol (Dhan returns 10+ years at once); 1-minute bars 90 days per request.
+`--rate` (default 3/s) and `--reserve` (default 800 calls) keep room for the live system.
 Docker: `docker compose run --rm tools python /app/backfill/backfill.py run --intervals D,1 --years 5`.
 
 ---
@@ -181,7 +210,8 @@ Docker: `docker compose run --rm tools python /app/backfill/backfill.py run --in
 3. Friends open the link once. The key is remembered in their browser, and a wrong key gets an
    access-key prompt.
 
-Never expose the gateway to the internet without `ACCESS_KEYS`.
+Never expose the gateway to the internet without `ACCESS_KEYS`. The ADMIN desk is switched off on a
+gateway with `ACCESS_KEYS` unless you also set `ADMIN_KEY`.
 
 > **Check the terms first.** Dhan's API data is licensed for your own use, and NSE regulates
 > redistribution of real-time market data. Sharing a live feed with other people can count as

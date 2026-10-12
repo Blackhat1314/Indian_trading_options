@@ -4,7 +4,9 @@ import type {
   AlertFire, ChainSnap, Clock, FnoSnap, Instrument, Market, NewsItem, RankSnap, SwingSnap, TopSnap,
 } from "./types";
 
-export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "system" | "geo";
+export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "system" | "geo" | "admin";
+/** open = no keys on the host (local use) · key = ADMIN_KEY required · off = shared gateway, no admin desk */
+export type AdminMode = "" | "open" | "key" | "off";
 
 export interface Toast { id: number; kind: "alert" | "event"; title: string; body: string; ts: number }
 
@@ -34,7 +36,9 @@ export interface LiveState {
   toasts: Toast[];
   unreadAlerts: number;
   helpOpen: boolean;
+  adminMode: AdminMode;
   setDesk: (d: DeskId) => void;
+  setAdminMode: (m: AdminMode) => void;
   select: (s: string) => void;
   setChain: (n: string) => void;
   setUniverse: (u: Instrument[]) => void;
@@ -71,6 +75,8 @@ export const useLive = create<LiveState>((set, get) => ({
   toasts: [],
   unreadAlerts: 0,
   helpOpen: false,
+  adminMode: "",
+  setAdminMode: (m) => set({ adminMode: m, ...(m === "off" && get().desk === "admin" ? { desk: "intraday" as DeskId } : {}) }),
   setDesk: (d) => {
     setPref("td.desk", d);
     set({ desk: d, ...(d === "alerts" ? { unreadAlerts: 0 } : {}) });

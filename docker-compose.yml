@@ -1,5 +1,6 @@
 # docker compose up -d --build     -> http://localhost:8000
 # More gateways: they are stateless — add replicas behind a reverse proxy (drop the host port mapping)
+# History (5 years):     open the ADMIN desk (F9) and press Start pull — or, from a script:
 # One-off jobs:          docker compose run --rm tools python /app/backfill/backfill.py plan --intervals D,1 --years 5
 #                        docker compose run --rm tools python /app/research/evaluate_intraday.py
 
@@ -44,6 +45,12 @@ services:
   geo:
     <<: *app
     command: ["python", "-m", "td.services.geo"]
+
+  # history pulls for the ADMIN desk (F9): its own container, paced around the live services and resumed after a
+  # redeploy (job + progress live in ./data/backfill). Stopping it never affects the live desks.
+  backfill:
+    <<: *app
+    command: ["python", "-m", "td.services.backfiller"]
 
   # stateless fan-out to browsers; scale it as wide as you like
   gateway:

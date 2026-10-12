@@ -9,12 +9,15 @@ Run:  uvicorn td.services.gateway:app --host 0.0.0.0 --port 8000
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import orjson
 import pandas as pd
@@ -26,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import __version__, bus
+from ..backfill import JobSpec
 from ..analytics import alerts as alerts_mod
 from ..analytics import smc
 from ..config import ROOT, settings
@@ -186,6 +190,48 @@ def auth(request: Request) -> str:
     return user_for_key(key)
 
 
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def _local_client(request: Request) -> bool:
+    return bool(request.client and request.client.host in LOOPBACK)
+
+
+def _admin_mode(request: Request) -> str:
+    """Effective admin mode for this request: 'open' only for requests from this machine."""
+    mode = settings.admin_mode()
+    return "off" if mode == "open" and not _local_client(request) else mode
+
+
+def _same_site(request: Request) -> bool:
+    """CORS is open (*) by default, so a page on another site could otherwise make the browser POST here.
+    The Host header is not trusted (DNS rebinding); local origins and explicit CORS_ORIGINS are."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return True                                   # scripts / curl / same-origin navigation
+    if urlsplit(origin).hostname in LOOPBACK:
+        return True                                   # the terminal on localhost or the Vite dev server
+    explicit = {o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip() not in ("", "*")}
+    return origin.rstrip("/") in explicit
+
+
+def admin(request: Request) -> str:
+    """ADMIN desk: history pulls spend the Dhan quota. Without keys it is open to this machine only; with
+    ACCESS_KEYS it needs ADMIN_KEY (and is off without one)."""
+    user = auth(request)
+    mode = _admin_mode(request)
+    if mode == "off":
+        raise HTTPException(403, "The admin desk is off here — it is open on the host itself (localhost); "
+                                 "set ADMIN_KEY in .env to use it from other machines")
+    if mode == "key":
+        given = (request.headers.get("x-admin-key") or "").encode()
+        if not hmac.compare_digest(given, settings.admin_key.encode()):
+            raise HTTPException(403, "admin key required")
+    elif request.method not in ("GET", "HEAD") and not _same_site(request):
+        raise HTTPException(403, "cross-site admin request blocked")      # (a valid admin key proves intent)
+    return user
+
+
 # -------------------------------------------------------------- websocket
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, key: str | None = Query(None)):
@@ -237,10 +283,11 @@ async def ws_endpoint(ws: WebSocket, key: str | None = Query(None)):
 
 # ------------------------------------------------------------------- REST
 @app.get("/api/meta")
-async def meta(user: str = Depends(auth)):
+async def meta(request: Request, user: str = Depends(auth)):
     return {"version": __version__, "user": user, "source": settings.data_source, "plan": settings.dhan_plan,
             "lock_time": settings.lock_time, "top_n": settings.top_n, "chains": settings.chain_list(),
             "or_minutes": settings.or_minutes, "auth": bool(settings.access_key_map()),
+            "admin": _admin_mode(request),
             "geo": {"enabled": settings.geo_enabled, "mode": settings.geo_mode,
                     "disabled": sorted(settings.geo_disabled())}}
 
@@ -433,7 +480,12 @@ async def system(user: str = Depends(auth)):
     vals = await r.mget(keys) if keys else []
     status = {k.decode().split(":", 2)[2]: bus.loads(v) for k, v in zip(keys, vals) if v}
     lake: Lake = app.state.lake
-    summary = await asyncio.to_thread(lake.summary)
+    cached = getattr(app.state, "lake_summary", None)
+    if cached and time.time() - cached[0] < 30:
+        summary = cached[1]
+    else:
+        summary = await asyncio.to_thread(lake.summary)
+        app.state.lake_summary = (time.time(), summary)
     info = await r.info("memory")
     streams = {}
     for s in (bus.STREAM_TICKS, bus.STREAM_NEWS, bus.STREAM_EVENTS):
@@ -455,6 +507,70 @@ async def system(user: str = Depends(auth)):
 @app.get("/api/lake/coverage")
 async def lake_coverage(user: str = Depends(auth)):
     return await asyncio.to_thread(app.state.lake.coverage)
+
+
+# ------------------------------------------------------------------ admin
+class PullIn(BaseModel):
+    intervals: list[str] = ["D", "1"]
+    years: float = 5
+    rate: float = 3
+    reserve: int = 2500
+    market_hours: str = "slow"
+    symbols: list[str] = []
+
+
+def _spec(body: PullIn) -> dict:
+    try:
+        return JobSpec.clean(body.model_dump()).as_dict()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+async def _admin_cmd(op: str, user: str, **extra) -> None:
+    await app.state.redis.lpush(bus.KEY_ADMIN_CMD, json.dumps({"op": op, "by": user, "ts": time.time(), **extra}))
+    await app.state.redis.expire(bus.KEY_ADMIN_CMD, 3600)
+
+
+@app.get("/api/admin/backfill")
+async def admin_backfill(user: str = Depends(admin)):
+    """Backfill worker status (None when the worker is not running)."""
+    raw = await app.state.redis.get(bus.KEY_ADMIN_STATUS)
+    return {"status": json.loads(raw) if raw else None, "source": settings.data_source, "user": user}
+
+
+@app.post("/api/admin/backfill/plan")
+async def admin_backfill_plan(body: PullIn, user: str = Depends(admin)):
+    """Ask the worker how many requests the pull still needs (it owns the resume state)."""
+    spec = _spec(body)
+    rid = uuid.uuid4().hex
+    await _admin_cmd("plan", user, id=rid, job=spec)
+    r = app.state.redis
+    for _ in range(40):
+        raw = await r.get(bus.k_admin_plan(rid))
+        if raw:
+            await r.delete(bus.k_admin_plan(rid))
+            return json.loads(raw)
+        await asyncio.sleep(0.25)
+    raise HTTPException(504, "the backfill worker did not answer — is it running?")
+
+
+@app.post("/api/admin/backfill/start")
+async def admin_backfill_start(body: PullIn, user: str = Depends(admin)):
+    spec = _spec(body)
+    await _admin_cmd("start", user, job=spec)
+    return {"ok": True, "job": spec}
+
+
+@app.post("/api/admin/backfill/stop")
+async def admin_backfill_stop(user: str = Depends(admin)):
+    await _admin_cmd("stop", user)
+    return {"ok": True}
+
+
+@app.post("/api/admin/backfill/coverage")
+async def admin_backfill_coverage(user: str = Depends(admin)):
+    await _admin_cmd("coverage", user)
+    return {"ok": True}
 
 
 @app.get("/api/health")

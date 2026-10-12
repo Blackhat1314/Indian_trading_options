@@ -12,7 +12,14 @@ export const DESKS: { id: DeskId; key: string; label: string; cmd: string }[] = 
   { id: "alerts", key: "F6", label: "ALERTS", cmd: "ALRT" },
   { id: "system", key: "F7", label: "SYSTEM", cmd: "SYS" },
   { id: "geo", key: "F8", label: "GEO", cmd: "GEO" },
+  { id: "admin", key: "F9", label: "ADMIN", cmd: "ADMIN" },
 ];
+
+/** The ADMIN desk only shows where the gateway allows it (see ADMIN_KEY in .env). */
+export function useDesks() {
+  const mode = useLive((s) => s.adminMode);
+  return DESKS.filter((d) => d.id !== "admin" || mode === "open" || mode === "key");
+}
 
 const PHASE_LABEL: Record<string, string> = {
   OPEN: "MARKET OPEN", PRE_OPEN: "PRE-OPEN", PRE_OPEN_MATCH: "PRE-OPEN", POST_CLOSE: "POST-CLOSE", CLOSED: "CLOSED",
@@ -20,6 +27,7 @@ const PHASE_LABEL: Record<string, string> = {
 
 function CommandBar() {
   const universe = useLive((s) => s.universe);
+  const desks = useDesks();
   const { select, setDesk, setChain, setHelp } = useLive.getState();
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
@@ -43,7 +51,7 @@ function CommandBar() {
   const matches = useMemo(() => {
     const s = q.trim().toUpperCase();
     if (!s) return [];
-    const fns = DESKS.filter((d) => d.cmd.startsWith(s) || d.label.startsWith(s)).map((d) => ({ kind: "fn" as const, text: d.cmd, sub: `${d.key} · ${d.label} desk`, desk: d.id }));
+    const fns = desks.filter((d) => d.cmd.startsWith(s) || d.label.startsWith(s)).map((d) => ({ kind: "fn" as const, text: d.cmd, sub: `${d.key} · ${d.label} desk`, desk: d.id }));
     const syms = universe
       .filter((i) => i.kind !== "FUT" && i.kind !== "MACRO" && (i.symbol.startsWith(s) || (s.length > 2 && i.symbol.includes(s))))
       .slice(0, 8)
@@ -51,12 +59,12 @@ function CommandBar() {
     const extra = s.startsWith("CHAIN") ? [{ kind: "fn" as const, text: s.includes(" ") ? s : "CHAIN NIFTY", sub: "option chain", desk: "fno" as DeskId }] : [];
     const help = "HELP".startsWith(s) ? [{ kind: "fn" as const, text: "HELP", sub: "keyboard & commands", desk: undefined }] : [];
     return [...extra, ...fns, ...syms, ...help].slice(0, 10);
-  }, [q, universe]);
+  }, [q, universe, desks]);
 
   const run = (text: string) => {
     const s = text.trim().toUpperCase();
     if (!s) return;
-    const fn = DESKS.find((d) => d.cmd === s || d.label === s);
+    const fn = desks.find((d) => d.cmd === s || d.label === s);
     if (fn) setDesk(fn.id);
     else if (s === "HELP" || s === "?") setHelp(true);
     else if (s.startsWith("CHAIN")) {
@@ -173,22 +181,23 @@ export function Tabs() {
   const desk = useLive((s) => s.desk);
   const setDesk = useLive((s) => s.setDesk);
   const unread = useLive((s) => s.unreadAlerts);
+  const desks = useDesks();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const idx = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"].indexOf(e.key);
-      const alt = e.altKey && /^[1-8]$/.test(e.key) ? Number(e.key) - 1 : -1;
+      const idx = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"].indexOf(e.key);
+      const alt = e.altKey && /^[1-9]$/.test(e.key) ? Number(e.key) - 1 : -1;
       const i = idx >= 0 ? idx : alt;
-      if (i >= 0) {
+      if (i >= 0 && i < desks.length) {
         e.preventDefault();
-        setDesk(DESKS[i].id);
+        setDesk(desks[i].id);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setDesk]);
+  }, [setDesk, desks]);
   return (
     <nav className="tabs" role="tablist" aria-label="Desks">
-      {DESKS.map((d) => (
+      {desks.map((d) => (
         <button key={d.id} role="tab" type="button" className="tab" aria-selected={desk === d.id} onClick={() => setDesk(d.id)}>
           <span className="fkey">{d.key}</span>
           {d.label}
@@ -261,9 +270,9 @@ export function HelpModal() {
         </header>
         <dl className="help-grid">
           <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the command line</dd>
-          <dt><kbd>F1</kbd>…<kbd>F8</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>8</kbd></dt><dd>Switch desk</dd>
+          <dt><kbd>F1</kbd>…<kbd>F9</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd></dt><dd>Switch desk (F9 ADMIN where enabled)</dd>
           <dt>RELIANCE <kbd>GO</kbd></dt><dd>Load a symbol in the chart & depth</dd>
-          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · SYS · GEO</dt><dd>Open a desk</dd>
+          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · SYS · GEO · ADMIN</dt><dd>Open a desk</dd>
           <dt>CHAIN BANKNIFTY</dt><dd>Option chain for an underlying</dd>
           <dt>Click a row</dt><dd>Select the stock everywhere</dd>
         </dl>

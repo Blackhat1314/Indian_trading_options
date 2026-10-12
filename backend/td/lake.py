@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +20,14 @@ import pyarrow.parquet as pq
 
 from .config import settings
 
+try:
+    import fcntl
+except ImportError:                    # Windows: in-process locking only
+    fcntl = None
+
 log = logging.getLogger("td.lake")
 COLUMNS = ["ts", "open", "high", "low", "close", "volume", "oi"]
+ROW_GROUP = 50_000      # rows per Parquet row group: reads of the last N bars touch only the last group or two
 _locks: dict[str, threading.Lock] = {}
 _guard = threading.Lock()
 
@@ -28,6 +35,31 @@ _guard = threading.Lock()
 def _lock_for(p: Path) -> threading.Lock:
     with _guard:
         return _locks.setdefault(str(p), threading.Lock())
+
+
+@contextmanager
+def _file_lock(p: Path):
+    """Exclusive lock across processes (the ingestor's auto-history and the backfill worker can both append to
+    the same file); a no-op where flock is unavailable."""
+    f = None
+    if fcntl is not None:
+        try:
+            d = p.parent / ".locks"
+            d.mkdir(exist_ok=True)
+            f = open(d / f"{p.name}.lock", "a+")
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except OSError:
+            if f:
+                f.close()
+            f = None
+    try:
+        yield
+    finally:
+        if f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            finally:
+                f.close()
 
 
 def _safe(symbol: str) -> str:
@@ -69,13 +101,14 @@ class Lake:
         df["oi"] = df["oi"].fillna(0).astype("int64")
         p = self.path(interval, symbol)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with _lock_for(p):                      # one writer per file (backfill runs concurrent workers)
+        with _lock_for(p), _file_lock(p):       # one writer per file, across threads and processes
             if p.exists():
                 old = pq.read_table(p).to_pandas()
                 df = pd.concat([old, df], ignore_index=True)
             df = df.drop_duplicates("ts", keep="last").sort_values("ts").reset_index(drop=True)
             tmp = p.with_name(f"{p.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
-            pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp, compression="zstd")
+            pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp, compression="zstd",
+                           row_group_size=ROW_GROUP)
             tmp.replace(p)
         return len(df)
 
@@ -85,6 +118,8 @@ class Lake:
         p = self.path(interval, symbol)
         if not p.exists():
             return pd.DataFrame(columns=COLUMNS)
+        if last_n is not None and start_ts is None and end_ts is None:
+            return _tail(p, last_n)
         filters = []
         if start_ts is not None:
             filters.append(("ts", ">=", int(start_ts)))
@@ -105,29 +140,24 @@ class Lake:
         p = self.path(interval, symbol)
         if not p.exists():
             return None
-        t = pq.read_table(p, columns=["ts"])
-        if t.num_rows == 0:
-            return None
-        return int(t.column("ts").to_numpy().max())
+        _, _, last = file_stats(p)
+        return last
 
     def coverage(self) -> list[dict]:
-        """Rows / first / last per interval and symbol (DuckDB, fast)."""
-        import duckdb
-
+        """Rows / first / last per interval and symbol, from Parquet footers (no data pages are read)."""
         out = []
         if not self.root.exists():
             return out
         for d in sorted(p for p in self.root.iterdir() if p.is_dir()):
-            files = list(d.glob("*.parquet"))
-            if not files:
-                continue
-            con = duckdb.connect()
-            q = (f"select filename, count(*) as n, min(ts) as t_first, max(ts) as t_last "
-                 f"from read_parquet('{d.as_posix()}/*.parquet', filename=true) group by filename")
-            for fn, n, first, last in con.execute(q).fetchall():
-                out.append({"interval": d.name, "symbol": Path(fn).stem.replace("AND", "&"), "rows": int(n),
-                            "first": int(first), "last": int(last)})
-            con.close()
+            for f in sorted(d.glob("*.parquet")):
+                try:
+                    rows, first, last = file_stats(f)
+                except (OSError, ValueError, pa.ArrowException) as e:    # replaced or half-written: skip
+                    log.debug("coverage: %s: %s", f, e)
+                    continue
+                if rows and first is not None:
+                    out.append({"interval": d.name, "symbol": _unsafe(f.stem), "rows": rows, "first": first,
+                                "last": last, "bytes": f.stat().st_size})
         return out
 
     def summary(self) -> dict:
@@ -157,3 +187,38 @@ def bars_from_dhan(payload: dict) -> pd.DataFrame:
         "oi": payload.get("open_interest") or [0] * n,
     })
     return df
+
+
+def file_stats(p: Path) -> tuple[int, int | None, int | None]:
+    """(rows, first ts, last ts) of a lake file from its footer; falls back to reading the ts column."""
+    with open(p, "rb") as fh:
+        pf = pq.ParquetFile(fh)
+        md = pf.metadata
+        if md.num_rows == 0:
+            return 0, None, None
+        i = md.schema.names.index("ts")
+        lo = hi = None
+        for g in range(md.num_row_groups):
+            st = md.row_group(g).column(i).statistics
+            if st is None or not st.has_min_max:
+                ts = pf.read(columns=["ts"]).column("ts").to_numpy()
+                return md.num_rows, int(ts.min()), int(ts.max())
+            lo = st.min if lo is None else min(lo, st.min)
+            hi = st.max if hi is None else max(hi, st.max)
+        return md.num_rows, int(lo), int(hi)
+
+
+def _tail(p: Path, n: int) -> pd.DataFrame:
+    """Last n rows (files are sorted by ts), reading only the trailing row groups."""
+    with open(p, "rb") as fh:
+        pf = pq.ParquetFile(fh)
+        groups, rows = [], 0
+        for g in range(pf.metadata.num_row_groups - 1, -1, -1):
+            groups.insert(0, g)
+            rows += pf.metadata.row_group(g).num_rows
+            if rows >= n:
+                break
+        if not groups:
+            return pd.DataFrame(columns=COLUMNS)
+        df = pf.read_row_groups(groups).to_pandas()
+    return df.tail(n).reset_index(drop=True) if n > 0 else df.iloc[0:0].reset_index(drop=True)

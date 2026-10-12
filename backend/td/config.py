@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     # comma separated name:key pairs for friends, e.g. "mayank:k1,rahul:k2". Empty = open access.
     access_keys: str = Field("", alias="ACCESS_KEYS")
     cors_origins: str = Field("*", alias="CORS_ORIGINS")
+    # ADMIN desk (F9): history pulls spend the Dhan quota. With ACCESS_KEYS set it needs this key; with neither
+    # set (localhost use) it is open.
+    admin_key: str = Field("", alias="ADMIN_KEY")
 
     @property
     def lake_dir(self) -> Path:
@@ -118,6 +121,12 @@ class Settings(BaseSettings):
 
     def geo_disabled(self) -> set[str]:
         return {x.strip().lower() for x in self.geo_disable.split(",") if x.strip()}
+
+    def admin_mode(self) -> str:
+        """key = ADMIN_KEY required · open = no keys configured (local use) · off = shared gateway without ADMIN_KEY."""
+        if self.admin_key:
+            return "key"
+        return "off" if self.access_key_map() else "open"
 
     def access_key_map(self) -> dict[str, str]:
         out: dict[str, str] = {}

@@ -4,7 +4,7 @@ import { HelpModal, StatusBar, Tabs, Toasts, TopBar } from "./components/Frame";
 import { Empty } from "./components/ui";
 import { api, ApiError } from "./lib/api";
 import { live } from "./lib/socket";
-import { useLive, type DeskId } from "./lib/store";
+import { useLive, type AdminMode, type DeskId } from "./lib/store";
 import type { Instrument } from "./lib/types";
 
 const Intraday = lazy(() => import("./desks/Intraday"));
@@ -15,6 +15,7 @@ const News = lazy(() => import("./desks/News"));
 const Alerts = lazy(() => import("./desks/Alerts"));
 const System = lazy(() => import("./desks/System"));
 const Geo = lazy(() => import("./desks/Geo"));
+const Admin = lazy(() => import("./desks/Admin"));
 
 const BASE_TOPICS = ["clock", "market", "top", "quotes", "geo:risk"];
 const DESK_TOPICS: Record<DeskId, string[]> = {
@@ -26,6 +27,7 @@ const DESK_TOPICS: Record<DeskId, string[]> = {
   alerts: [],
   system: [],
   geo: [],          // the GEO desk subscribes per switched-on view
+  admin: [],        // polls /api/admin/backfill instead (admin-only, never on the shared bus)
 };
 
 /** Shown when the gateway requires an access key (ACCESS_KEYS is set on the host). */
@@ -60,6 +62,7 @@ export default function App() {
   const desk = useLive((s) => s.desk);
   const conn = useLive((s) => s.conn);
   const setUniverse = useLive((s) => s.setUniverse);
+  const setAdminMode = useLive((s) => s.setAdminMode);
 
   useEffect(() => {
     live.sub(BASE_TOPICS);
@@ -73,7 +76,11 @@ export default function App() {
         else window.setTimeout(loadUniverse, 3000);
       });
     loadUniverse();
-  }, [setUniverse]);
+    const loadMeta = () =>
+      api<{ admin?: AdminMode }>("/api/meta").then((m) => setAdminMode(m.admin ?? "off"))
+        .catch((e: ApiError) => { if (e.status !== 401) window.setTimeout(loadMeta, 5000); });
+    loadMeta();
+  }, [setUniverse, setAdminMode]);
 
   useEffect(() => {
     const want = DESK_TOPICS[desk];
@@ -99,6 +106,7 @@ export default function App() {
             {desk === "alerts" && <Alerts />}
             {desk === "system" && <System />}
             {desk === "geo" && <Geo />}
+            {desk === "admin" && <Admin />}
           </Suspense>
         </div>
       </main>

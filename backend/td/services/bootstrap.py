@@ -46,6 +46,7 @@ class HistoryBootstrap:
         self.lake = lake or Lake()
         self.status = {"stage": "waiting", "done": 0, "total": 0, "errors": 0, "updated": None, "last_error": ""}
         self.sem = asyncio.Semaphore(5)
+        self.pub.stats["history"] = dict(self.status)       # visible at once (the backfill worker waits on it)
 
     # ------------------------------------------------------------ helpers
     def _st(self, stage: str, done: int = 0, total: int = 0):
@@ -132,7 +133,8 @@ class HistoryBootstrap:
         insts = self.universe.equities()
 
         async def one(i: Instrument):
-            m = self.lake.read("1m", i.symbol, last_n=375 * 12)
+            # off the event loop: with years of 1-minute history a file read takes long enough to stall the feed
+            m = await asyncio.to_thread(self.lake.read, "1m", i.symbol, None, None, 375 * 12)
             start = datetime.combine(today - timedelta(days=30), datetime.min.time())
             if not m.empty:
                 days = {from_epoch(t).date() for t in m["ts"].iloc[::60]}

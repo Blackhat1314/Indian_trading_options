@@ -184,6 +184,7 @@ async def run_sim(r, universe: Universe, pub: Publisher, stop: asyncio.Event) ->
 async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -> None:
     from ..dhan.feeds import CasFeed, Depth20Feed, MarketFeedManager, Sub
     from ..dhan.rest import DhanError, DhanRest
+    from ..ratelimit import BudgetExhausted
 
     rest = DhanRest(redis=r)
     subs: list[Sub] = []
@@ -303,6 +304,11 @@ async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -
                     await pub.news(out)
             except DhanError as e:
                 log.warning("news: %s", e)
+            except BudgetExhausted as e:
+                # out of today's data calls: pause news (a crash here would take the whole ingestor down)
+                log.warning("news paused: %s", e)
+                await asyncio.sleep(900)
+                continue
             ph = phase(now_ist())
             await asyncio.sleep(20 if ph in ("OPEN", "PRE_OPEN", "PRE_OPEN_MATCH") else 180)
 
