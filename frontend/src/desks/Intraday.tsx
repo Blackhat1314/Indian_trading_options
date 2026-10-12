@@ -77,7 +77,7 @@ function TopPicks() {
                 <span className="muted" style={{ marginLeft: "auto" }}>{list.length}/{5}</span>
               </div>
               {list.length === 0 && <Empty>{ranked === 0
-                ? "No ranking yet — waiting for previous closes and history (live mode loads them from Dhan automatically; progress on SYSTEM)."
+                ? "No ranking yet — waiting for previous closes and history (live mode loads them from Dhan automatically, a few minutes after start; admins see progress under /admin → SYSTEM)."
                 : "No stock passes the filters yet — the system abstains rather than force a pick."}</Empty>}
               {list.map((p, i) => <PickRow key={p.symbol} p={p} i={i} side={side} locked={top.locked} selected={selected === p.symbol} />)}
             </div>

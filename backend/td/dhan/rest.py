@@ -62,6 +62,7 @@ class DhanRest:
             await self.quote_bucket.acquire()
         self.calls[kind] = self.calls.get(kind, 0) + 1
         delay = 1.0
+        last_status = None
         for attempt in range(retries):
             try:
                 r = await self._http.post(self.base + path, json=payload, headers=self._headers())
@@ -74,6 +75,7 @@ class DhanRest:
                 continue
             if r.status_code == 429 or (r.status_code >= 500 and attempt < retries - 1):
                 self.calls["errors"] += 1
+                last_status = r.status_code
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
@@ -95,7 +97,7 @@ class DhanRest:
                     continue
                 raise DhanError(f"{path}: {msg}", code=code, status=r.status_code)
             return body
-        raise DhanError(f"{path}: retries exhausted")
+        raise DhanError(f"{path}: retries exhausted", status=last_status)
 
     # ------------------------------------------------------------------ quotes
     async def quote(self, instruments: dict[str, list[int]], mode: str = "quote") -> dict:
@@ -113,21 +115,22 @@ class DhanRest:
 
     # -------------------------------------------------------------- historical
     async def daily(self, security_id: str | int, segment: str, instrument: str,
-                    start: date, end: date, oi: bool = False, expiry_code: int | None = None) -> dict:
+                    start: date, end: date, oi: bool = False, expiry_code: int | None = None,
+                    retries: int = 3) -> dict:
         payload = {"securityId": str(security_id), "exchangeSegment": segment, "instrument": instrument,
                    "oi": oi, "fromDate": start.isoformat(), "toDate": end.isoformat()}
         if expiry_code is not None:
             payload["expiryCode"] = expiry_code
-        body = await self._post("/charts/historical", payload)
+        body = await self._post("/charts/historical", payload, retries=retries)
         return body if isinstance(body, dict) else {}
 
     async def intraday(self, security_id: str | int, segment: str, instrument: str, interval: int,
-                       start: datetime, end: datetime, oi: bool = False) -> dict:
+                       start: datetime, end: datetime, oi: bool = False, retries: int = 3) -> dict:
         """interval ∈ {1,5,15,25,60}; max 90 days per request."""
         payload = {"securityId": str(security_id), "exchangeSegment": segment, "instrument": instrument,
                    "interval": str(interval), "oi": oi,
                    "fromDate": start.strftime("%Y-%m-%d %H:%M:%S"), "toDate": end.strftime("%Y-%m-%d %H:%M:%S")}
-        body = await self._post("/charts/intraday", payload)
+        body = await self._post("/charts/intraday", payload, retries=retries)
         return body if isinstance(body, dict) else {}
 
     async def rolling_option(self, security_id: int, segment: str, instrument: str, expiry_flag: str,

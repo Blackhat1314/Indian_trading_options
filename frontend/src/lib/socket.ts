@@ -1,4 +1,5 @@
 import { wsUrl } from "./api";
+import { getMe, toLogin } from "./auth";
 import { useLive } from "./store";
 
 /** Single websocket to the gateway with auto-reconnect and topic subscriptions.
@@ -32,8 +33,17 @@ class LiveSocket {
     ws.onclose = (ev) => {
       useLive.getState().setConn("closed");
       window.clearInterval(this.pingTimer);
+      if (ev.code === 4403) {
+        // the gateway refused this page's origin: usually a proxy that hides the real host name
+        useLive.getState().setConn("denied", "Live data refused (origin check). Behind a proxy, forward the Host or X-Forwarded-Host header, or add this address to CORS_ORIGINS.");
+        return;
+      }
       if (ev.code === 4401) {
-        useLive.getState().setConn("denied"); // bad / missing access key — don't hammer the server
+        // session ended — or just renewed (own password change): ask before sending anyone to /login
+        getMe().then((m) => {
+          if (m.user) window.setTimeout(() => this.connect(), 300);
+          else { useLive.getState().setConn("denied"); toLogin(); }
+        }).catch(() => window.setTimeout(() => this.connect(), 3000));
         return;
       }
       const delay = Math.min(10000, 500 * 2 ** this.retry++);

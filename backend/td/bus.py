@@ -25,6 +25,14 @@ KEY_ALERT_LOG = "td:alerts:log"      # list of fired alerts
 KEY_SCORECARD = "td:scorecard"       # list of daily scorecards (json)
 PUB_PREFIX = "td:pub:"
 SNAP_PREFIX = "td:snap:"
+# Admin page (HISTORY) <-> backfill worker. Outside td:snap:* / td:status:* on purpose: those are readable by every
+# viewer (snapshot API, status keys); these are served only through the admin endpoints.
+KEY_ADMIN_CMD = "td:admin:backfill:cmd"          # list of commands (gateway LPUSH, worker BRPOP)
+KEY_ADMIN_STATUS = "td:admin:backfill:status"    # worker status json (expires when the worker stops)
+
+
+def k_admin_plan(req_id: str) -> str:
+    return f"td:admin:backfill:plan:{req_id}"     # answer to one plan request
 
 
 def k_status(service: str) -> str:

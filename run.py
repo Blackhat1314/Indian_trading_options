@@ -6,8 +6,9 @@
     python run.py --live          # Dhan live feed (needs DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env)
     python run.py --build-ui      # rebuild the React app first (needs Node 20+)
 
-Starts four processes — ingestor (the only Dhan consumer), analytics, geo (world events), gateway — and
-prefixes their logs. Redis must be reachable at REDIS_URL (default localhost:6379):
+Starts the ingestor (the only live Dhan consumer), analytics, geo (world events), gateway and the backfill
+worker behind the admin page (/admin → HISTORY), and prefixes their logs. The backfill worker is optional: if it stops it is
+restarted and never takes the live services down. Redis must be reachable at REDIS_URL (default localhost:6379):
     docker run -d --name td-redis -p 6379:6379 redis:7-alpine
 Open http://localhost:8000 when the gateway says it is up. Ctrl+C stops everything.
 """
@@ -25,8 +26,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "backend"
-COLORS = {"ingestor": "\033[33m", "analytics": "\033[36m", "geo": "\033[32m", "gateway": "\033[35m"}
+COLORS = {"ingestor": "\033[33m", "analytics": "\033[36m", "geo": "\033[32m", "gateway": "\033[35m",
+          "backfill": "\033[34m"}
 RESET = "\033[0m"
+OPTIONAL = {"backfill"}          # restarted when it exits; never stops the live stack
+RESTART_AFTER = 15               # seconds
 
 
 def pump(name: str, proc: subprocess.Popen, color: bool) -> None:
@@ -34,6 +38,17 @@ def pump(name: str, proc: subprocess.Popen, color: bool) -> None:
     for line in iter(proc.stdout.readline, ""):
         sys.stdout.write(f"{tag} | {line}")
         sys.stdout.flush()
+
+
+def ui_stale(dist: Path) -> bool:
+    """True when the frontend sources are newer than the last build (e.g. after a git pull)."""
+    index = dist / "index.html"
+    if not index.exists():
+        return True
+    src = ROOT / "frontend"
+    files = [f for f in (src / "src").rglob("*") if f.is_file()] + [src / "index.html", src / "package.json"]
+    newest = max((f.stat().st_mtime for f in files if f.exists()), default=0.0)
+    return newest > index.stat().st_mtime
 
 
 def redis_ok(url: str) -> bool:
@@ -79,8 +94,8 @@ def main() -> int:
         return 1
 
     dist = ROOT / "frontend" / "dist"
+    npm = shutil.which("npm")
     if a.build_ui or not dist.exists():
-        npm = shutil.which("npm")
         if not npm:
             print("frontend/dist is missing and npm was not found — install Node 20+ or use docker compose.")
             return 1
@@ -88,6 +103,17 @@ def main() -> int:
         subprocess.run([npm, "ci" if (ROOT / "frontend" / "package-lock.json").exists() else "install"],
                        cwd=ROOT / "frontend", check=True)
         subprocess.run([npm, "run", "build"], cwd=ROOT / "frontend", check=True)
+    elif ui_stale(dist):
+        if not npm:
+            print("frontend sources changed since the last build but npm was not found — serving the previous build.")
+        else:
+            print("frontend sources changed — rebuilding the UI…")
+            try:
+                if not (ROOT / "frontend" / "node_modules").exists():
+                    subprocess.run([npm, "ci"], cwd=ROOT / "frontend", check=True)
+                subprocess.run([npm, "run", "build"], cwd=ROOT / "frontend", check=True)
+            except (subprocess.CalledProcessError, OSError) as e:
+                print(f"UI rebuild failed ({e}) — serving the previous build.")
 
     port = a.port or settings.gateway_port
     py = sys.executable
@@ -97,30 +123,47 @@ def main() -> int:
         "geo": [py, "-m", "td.services.geo"],
         "gateway": [py, "-m", "uvicorn", "td.services.gateway:app", "--host", settings.gateway_host,
                     "--port", str(port), "--log-level", "warning"],
+        "backfill": [py, "-m", "td.services.backfiller"],
     }
     color = sys.stdout.isatty() and os.name != "nt" or bool(os.environ.get("WT_SESSION"))
     procs: dict[str, subprocess.Popen] = {}
-    for name, cmd in cmds.items():
-        procs[name] = subprocess.Popen(cmd, cwd=BACKEND, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, bufsize=1)
+
+    def launch(name: str) -> None:
+        procs[name] = subprocess.Popen(cmds[name], cwd=BACKEND, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, bufsize=1)
         threading.Thread(target=pump, args=(name, procs[name], color), daemon=True).start()
+
+    for name in cmds:
+        launch(name)
         time.sleep(1.5 if name == "ingestor" else 0.5)
 
     src = "SIMULATOR" if settings.data_source == "sim" else f"DHAN LIVE ({settings.dhan_plan} plan)"
     print(f"\n  TradeDesk · {src} · open http://localhost:{port}"
-          + ("   (access keys required)" if settings.access_keys else "") + "\n")
+          + ("   (access keys required)" if settings.access_keys else "")
+          + f"\n  Admin page (users, history pulls, system): http://localhost:{port}/admin\n")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    restart_at: dict[str, float] = {}
     try:
         while not stop.is_set():
-            for name, p in procs.items():
-                if p.poll() is not None:
-                    print(f"{name} exited with code {p.returncode} — stopping the stack")
-                    stop.set()
-                    break
+            for name, p in list(procs.items()):
+                if p.poll() is None:
+                    continue
+                if name in OPTIONAL:
+                    if name not in restart_at:
+                        print(f"{name} exited with code {p.returncode} — restarting it in {RESTART_AFTER} s "
+                              "(the live desks are not affected)")
+                        restart_at[name] = time.time() + RESTART_AFTER
+                    elif time.time() >= restart_at[name]:
+                        del restart_at[name]
+                        launch(name)
+                    continue
+                print(f"{name} exited with code {p.returncode} — stopping the stack")
+                stop.set()
+                break
             stop.wait(1.0)
     finally:
         for p in procs.values():

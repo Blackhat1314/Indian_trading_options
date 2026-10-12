@@ -1,20 +1,20 @@
-#!/usr/bin/env python3
 """TradeDesk backfill — pulls up to 5 years of Dhan history into the shared Parquet lake.
 
-Separate from the live system on purpose: run it once (it resumes automatically across
-days because of Dhan's 7,000 data-calls/day limit), then `update` daily after the close.
-The lake is read by the live analytics, the swing scanner, the research scripts — and by
-anything else you build (it's plain Parquet).
+The same engine runs behind the admin page (/admin → HISTORY, admin login), which is the easy way to do this: it pulls
+in a background worker, paced so the live desks are not affected, and carries on by itself after midnight
+IST when a day's quota runs out. This CLI is for scripts and cron. Only one pull runs at a time (a Redis
+lock shared with the admin worker), and both resume from the same state (data/backfill/state.json).
 
   python backfill/backfill.py plan    --intervals D,1 --years 5           # calls needed + ETA
-  python backfill/backfill.py run     --intervals D,1,5 --years 5         # resumable
+  python backfill/backfill.py run     --intervals D,1 --years 5           # resumable, across days too
   python backfill/backfill.py update                                      # incremental top-up
   python backfill/backfill.py options --underlyings NIFTY,BANKNIFTY --strikes 2 --years 1
   python backfill/backfill.py status                                      # lake coverage
   python backfill/backfill.py sim                                         # synthetic lake (no Dhan)
 
-Rate limits honoured: 5 req/s, daily budget (default 7,000, shared through Redis with the
-live ingestor) minus a reserve you choose with --reserve.
+Rate limits honoured: --rate requests/s (default 3, leaving room for the live ingestor under Dhan's 5/s),
+and the daily budget (default 7,000, shared through Redis with the live ingestor) minus --reserve
+(default 2,500: the live app itself uses ~2,000 calls on a trading day).
 """
 from __future__ import annotations
 
@@ -22,169 +22,131 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import socket
 import sys
-import time
-from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from td import backfill as bf  # noqa: E402
 from td.config import settings  # noqa: E402
 from td.dhan.instruments import Universe, dhan_universe, sim_universe  # noqa: E402
-from td.lake import Lake, bars_from_dhan  # noqa: E402
-from td.ratelimit import BudgetExhausted  # noqa: E402
+from td.lake import Lake  # noqa: E402
 from td.timeutil import IST, now_ist  # noqa: E402
 
 log = logging.getLogger("backfill")
-STATE_DIR = Path(settings.data_dir) / "backfill"
-INTERVALS = {"D": None, "1": 1, "5": 5, "15": 15, "25": 25, "60": 60}
-LAKE_NAME = {"D": "D", "1": "1m", "5": "5m", "15": "15m", "25": "25m", "60": "60m"}
-INTRADAY_CHUNK_DAYS = 90       # Dhan: max 90 days per intraday request
-DAILY_CHUNK_DAYS = 365
+STATE_DIR = bf.state_dir()
+LAKE_NAME = bf.LAKE_NAME
+load_state, save_state = bf.load_state, bf.save_state
 
 
-@dataclass
-class Job:
-    symbol: str
-    sid: int
-    seg: str
-    instrument: str
-    interval: str
-    start: str
-    end: str
-
-    @property
-    def key(self) -> str:
-        return f"{self.interval}|{self.symbol}|{self.start}|{self.end}"
+def _lake() -> Lake:
+    return Lake(Path(settings.data_dir) / "lake" / "dhan")
 
 
-def load_state() -> dict:
-    p = STATE_DIR / "state.json"
-    if p.exists():
-        return json.loads(p.read_text())
-    return {"done": {}, "empty": {}, "failed": {}}
+def _since(intervals: list[str]) -> dict:
+    """Last bar per symbol in the lake (for `update`)."""
+    lake = _lake()
+    since = {}
+    for iv in intervals:
+        for sym in lake.symbols(LAKE_NAME[iv]):
+            ts = lake.last_ts(LAKE_NAME[iv], sym)
+            if ts:
+                since[(iv, sym)] = datetime.fromtimestamp(ts, tz=IST).date()
+    return since
 
 
-def save_state(st: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_DIR / "state.tmp"
-    tmp.write_text(json.dumps(st))
-    tmp.replace(STATE_DIR / "state.json")
-
-
-def targets(universe: Universe, symbols: set[str] | None, include_index: bool = True) -> list[tuple[str, int, str, str]]:
-    out = []
-    for i in universe.instruments:
-        if symbols and i.symbol not in symbols:
-            continue
-        if i.kind == "EQ":
-            out.append((i.symbol, i.sid, "NSE_EQ", "EQUITY"))
-        elif i.kind == "IDX" and include_index:
-            out.append((i.symbol, i.sid, "IDX_I", "INDEX"))
-    return out
-
-
-def make_jobs(universe: Universe, intervals: list[str], years: float, symbols: set[str] | None,
-              since: dict[tuple[str, str], int] | None = None) -> list[Job]:
+def _jobs(universe: Universe, intervals: list[str], years: float, symbols: set[str] | None,
+          since: dict | None = None) -> list[bf.Job]:
     today = now_ist().date()
-    start_all = today - timedelta(days=int(365.25 * years))
-    jobs: list[Job] = []
-    for sym, sid, seg, inst in targets(universe, symbols):
-        for iv in intervals:
-            start = start_all
-            if since and (iv, sym) in since:
-                start = max(start_all, datetime.fromtimestamp(since[(iv, sym)], tz=IST).date())
-            step = DAILY_CHUNK_DAYS if iv == "D" else INTRADAY_CHUNK_DAYS
-            cur = start
-            while cur <= today:
-                end = min(today + timedelta(days=1), cur + timedelta(days=step))
-                jobs.append(Job(sym, sid, seg, inst, iv, cur.isoformat(), end.isoformat()))
-                cur = end
-    return jobs
+    st = bf.compact(bf.load_state(), today)
+    return bf.make_jobs(bf.targets(universe.instruments, symbols), intervals, years, today,
+                        bf.coverage_from_state(st, today), since, recent=since is not None)
 
 
-async def run_jobs(jobs: list[Job], reserve: int, concurrency: int = 5) -> dict:
-    from td.bus import connect
-    from td.dhan.rest import DhanError, DhanRest
+class _Session:
+    """One CLI pull: Redis (the daily budget shared with the live ingestor), the pull lock shared with the admin
+    worker, and a Dhan client. `stop` is set if the lock is lost, so two pulls never write together."""
 
-    redis = None
-    try:
-        redis = connect()
-        await redis.ping()
-    except Exception:
-        redis = None
-        log.info("Redis not reachable — using a local budget file (start Redis to share the budget with the ingestor)")
-    rest = DhanRest(redis=redis, budget_file=STATE_DIR / "budget.json")
-    lake = Lake(Path(settings.data_dir) / "lake" / "dhan")
-    st = load_state()
-    pending = [j for j in jobs if j.key not in st["done"] and j.key not in st["empty"]]
-    log.info("%d jobs pending (%d already done)", len(pending), len(jobs) - len(pending))
-    q: asyncio.Queue = asyncio.Queue()
-    for j in pending:
-        q.put_nowait(j)
-    stats = {"ok": 0, "empty": 0, "failed": 0, "rows": 0, "stopped": None}
-    t0 = time.time()
-    stop = asyncio.Event()
+    async def __aenter__(self) -> "_Session":
+        from td.bus import connect
+        from td.dhan.rest import DhanRest
 
-    async def worker():
-        while not q.empty() and not stop.is_set():
-            j: Job = await q.get()
-            remaining = await rest.data_budget.remaining()
-            if remaining <= reserve:
-                stats["stopped"] = f"daily budget reserve reached ({remaining} left) — run again tomorrow to resume"
-                stop.set()
-                return
+        self.redis = None
+        try:
+            r = connect()
+            await r.ping()
+            self.redis = r
+        except Exception:
+            log.info("Redis not reachable — using a local budget file (start Redis to share the budget with the "
+                     "ingestor)")
+        self.stop = asyncio.Event()
+        self.lock = bf.RunLock(self.redis, f"cli@{socket.gethostname()}:{os.getpid()}") if self.redis else None
+        if self.lock and not await self.lock.acquire():
+            holder = await self.lock.holder()
+            await self.redis.aclose()
+            sys.exit(f"Another pull is running ({holder}). Stop it on the admin page or wait for it to finish.")
+        self.keeper = asyncio.create_task(self._keep()) if self.lock else None
+        self.rest = DhanRest(redis=self.redis, budget_file=STATE_DIR / "budget.json")
+        return self
+
+    async def _keep(self) -> None:
+        while True:
+            await asyncio.sleep(30)
             try:
-                if j.interval == "D":
-                    payload = await rest.daily(j.sid, j.seg, j.instrument, date.fromisoformat(j.start),
-                                               date.fromisoformat(j.end))
-                else:
-                    s = datetime.fromisoformat(j.start).replace(hour=9, minute=15)
-                    e = datetime.fromisoformat(j.end).replace(hour=15, minute=30)
-                    payload = await rest.intraday(j.sid, j.seg, j.instrument, INTERVALS[j.interval], s, e)
-                df = bars_from_dhan(payload)
-                if df.empty:
-                    st["empty"][j.key] = 1
-                    stats["empty"] += 1
-                else:
-                    await asyncio.to_thread(lake.write, LAKE_NAME[j.interval], j.symbol, df)
-                    st["done"][j.key] = len(df)
-                    stats["ok"] += 1
-                    stats["rows"] += len(df)
-            except BudgetExhausted as e:
-                stats["stopped"] = str(e)
-                stop.set()
+                ok = await self.lock.refresh()
+            except Exception:                      # Redis hiccup: try again next time
+                continue
+            if not ok:
+                log.warning("lost the pull lock — stopping so two pulls never write the same files")
+                self.stop.set()
                 return
-            except DhanError as e:
-                if getattr(e, "code", None) in (807, 808, 809, 810, "DH-901", 806, "806"):
-                    stats["stopped"] = f"auth/subscription error: {e}"
-                    stop.set()
-                    return
-                st["failed"][j.key] = str(e)[:200]
-                stats["failed"] += 1
-            done = stats["ok"] + stats["empty"] + stats["failed"]
-            if done % 25 == 0:
-                save_state(st)
-                rate = done / max(1e-6, time.time() - t0)
-                log.info("progress %d/%d  rows=%d  %.1f req/s  budget left=%d", done, len(pending), stats["rows"],
-                         rate, await rest.data_budget.remaining())
-    await asyncio.gather(*(worker() for _ in range(concurrency)))
-    save_state(st)
-    await rest.close()
-    if redis:
-        await redis.aclose()
-    return stats
+
+    async def __aexit__(self, *exc) -> None:
+        if self.keeper:
+            self.keeper.cancel()
+        await self.rest.close()
+        if self.lock:
+            await self.lock.release()
+        if self.redis:
+            await self.redis.aclose()
+
+
+async def run_jobs(jobs: list[bf.Job], reserve: int, rate: float) -> dict:
+    today = now_ist().date()
+    st = bf.compact(bf.load_state(), today)
+    log.info("%d requests pending", len(jobs))
+    last = [0]
+
+    def progress(p: bf.Progress) -> None:
+        if p.done - last[0] >= 25 or p.done == p.total:
+            last[0] = p.done
+            log.info("progress %d/%d  rows=%d  %.1f req/s", p.done, p.total, p.rows, p.as_dict()["rate"])
+
+    async with _Session() as ses:
+        reason, prog = await bf.run_jobs(jobs, ses.rest, _lake(), st, today=today, rate=rate, reserve=reserve,
+                                         stop=ses.stop, on_progress=progress)
+    stopped = {"complete": None, "reserve": "daily budget reserve reached — run again tomorrow to resume",
+               "budget": "daily budget exhausted — run again tomorrow to resume"}.get(reason, reason)
+    return {"ok": prog.ok, "empty": prog.empty, "failed": prog.failed, "rows": prog.rows, "stopped": stopped}
 
 
 async def run_options(underlyings: list[str], strikes: int, years: float, interval: int, reserve: int) -> dict:
     """Expired options (rolling ATM±N, CE & PE) — 30 days per call. Stored as lake interval 'opt'."""
-    from td.dhan.rest import DhanError, DhanRest
+    async with _Session() as ses:
+        return await _options(ses, underlyings, strikes, years, interval, reserve)
+
+
+async def _options(ses: "_Session", underlyings: list[str], strikes: int, years: float, interval: int,
+                   reserve: int) -> dict:
+    from td.dhan.rest import DhanError
     from td.universe_data import INDICES
     import pandas as pd
 
-    rest = DhanRest(budget_file=STATE_DIR / "budget.json")
+    rest = ses.rest
     lake = Lake(Path(settings.data_dir) / "lake" / "dhan")
     st = load_state()
     today = now_ist().date()
@@ -205,7 +167,11 @@ async def run_options(underlyings: list[str], strikes: int, years: float, interv
                     if key in st["done"]:
                         cur = end
                         continue
+                    if ses.stop.is_set():
+                        save_state(st)
+                        return out | {"stopped": "lost the pull lock"}
                     if await rest.data_budget.remaining() <= reserve:
+                        save_state(st)
                         return out | {"stopped": "budget reserve reached"}
                     try:
                         p = await rest.rolling_option(sid, "NSE_FNO", "OPTIDX", "WEEK" if und == "NIFTY" else "MONTH",
@@ -234,23 +200,20 @@ async def run_options(underlyings: list[str], strikes: int, years: float, interv
 
 def cmd_plan(args, universe):
     intervals = args.intervals.split(",")
-    jobs = make_jobs(universe, intervals, args.years, _symbols(args))
-    st = load_state()
-    pending = [j for j in jobs if j.key not in st["done"] and j.key not in st["empty"]]
-    per_day = max(1, settings.limit_data_per_day - args.reserve)
-    print(f"instruments: {len(targets(universe, _symbols(args)))}   intervals: {intervals}   years: {args.years}")
-    print(f"requests total: {len(jobs)}   pending: {len(pending)}")
-    print(f"daily budget: {settings.limit_data_per_day} - reserve {args.reserve} = {per_day} calls/day")
-    print(f"=> ~{len(pending) / per_day:.1f} day(s) of quota;  at 5 req/s ~{len(pending) / 5 / 60:.0f} min of run time")
-    by = {}
-    for j in pending:
-        by[j.interval] = by.get(j.interval, 0) + 1
-    for k, v in by.items():
+    jobs = _jobs(universe, intervals, args.years, _symbols(args))
+    s = bf.summarize(jobs, None, args.reserve, args.rate)
+    print(f"instruments: {len(bf.targets(universe.instruments, _symbols(args)))}   intervals: {intervals}   "
+          f"years: {args.years}")
+    print(f"requests pending: {s['requests']}  (ranges already in the lake are skipped)")
+    print(f"daily budget: {settings.limit_data_per_day} - reserve {args.reserve} = {s['per_day']} calls/day")
+    print(f"=> ~{s['days_of_quota']} day(s) of quota;  ~{s['run_minutes']:.0f} min of run time at {args.rate} req/s")
+    for k, v in s["by_interval"].items():
         print(f"   {k:>3}: {v} requests")
 
 
 def _symbols(args) -> set[str] | None:
-    return {s.strip().upper() for s in args.symbols.split(",")} if getattr(args, "symbols", "") else None
+    return {s.strip().upper() for s in args.symbols.split(",") if s.strip()} if getattr(args, "symbols", "") \
+        else None
 
 
 def main():
@@ -261,16 +224,19 @@ def main():
         p.add_argument("--intervals", default="D,1")
         p.add_argument("--years", type=float, default=5)
         p.add_argument("--symbols", default="")
-        p.add_argument("--reserve", type=int, default=800, help="calls to leave for the live system today")
+        p.add_argument("--reserve", type=int, default=2500,
+                       help="calls to leave for the live system today (it uses ~2,000 on a trading day)")
+        p.add_argument("--rate", type=float, default=3.0, help="requests per second (Dhan allows 5 in total)")
     p = sub.add_parser("update")
     p.add_argument("--intervals", default="D,1")
-    p.add_argument("--reserve", type=int, default=800)
+    p.add_argument("--reserve", type=int, default=2500)
+    p.add_argument("--rate", type=float, default=3.0)
     p = sub.add_parser("options")
     p.add_argument("--underlyings", default="NIFTY,BANKNIFTY")
     p.add_argument("--strikes", type=int, default=2)
     p.add_argument("--years", type=float, default=1)
     p.add_argument("--interval", type=int, default=5)
-    p.add_argument("--reserve", type=int, default=800)
+    p.add_argument("--reserve", type=int, default=2500)
     sub.add_parser("status")
     p = sub.add_parser("sim")
     p.add_argument("--days", type=int, default=320)
@@ -317,19 +283,13 @@ def main():
     if args.cmd == "plan":
         cmd_plan(args, universe)
     elif args.cmd == "run":
-        jobs = make_jobs(universe, args.intervals.split(","), args.years, _symbols(args))
-        stats = asyncio.run(run_jobs(jobs, args.reserve))
+        jobs = _jobs(universe, args.intervals.split(","), args.years, _symbols(args))
+        stats = asyncio.run(run_jobs(jobs, args.reserve, args.rate))
         print(json.dumps(stats, indent=2))
     elif args.cmd == "update":
-        lake = Lake(Path(settings.data_dir) / "lake" / "dhan")
-        since = {}
-        for iv in args.intervals.split(","):
-            for sym in lake.symbols(LAKE_NAME[iv]):
-                ts = lake.last_ts(LAKE_NAME[iv], sym)
-                if ts:
-                    since[(iv, sym)] = ts
-        jobs = make_jobs(universe, args.intervals.split(","), 5, None, since)
-        stats = asyncio.run(run_jobs(jobs, args.reserve))
+        ivs = args.intervals.split(",")
+        jobs = _jobs(universe, ivs, 5, None, _since(ivs))
+        stats = asyncio.run(run_jobs(jobs, args.reserve, args.rate))
         print(json.dumps(stats, indent=2))
     elif args.cmd == "options":
         stats = asyncio.run(run_options(args.underlyings.split(","), args.strikes, args.years, args.interval,

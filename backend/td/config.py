@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     # comma separated name:key pairs for friends, e.g. "mayank:k1,rahul:k2". Empty = open access.
     access_keys: str = Field("", alias="ACCESS_KEYS")
     cors_origins: str = Field("*", alias="CORS_ORIGINS")
+    # Accounts (login page, /admin): the first admin is created from these if it does not exist yet. Without
+    # them, /login offers a one-time setup to the host itself (localhost) while there are no users.
+    admin_user: str = Field("", alias="ADMIN_USER")
+    admin_password: str = Field("", alias="ADMIN_PASSWORD")
+    session_days: float = Field(30, alias="SESSION_DAYS")            # login lasts this long
+    session_secret: str = Field("", alias="SESSION_SECRET")          # default: data/auth/secret.key (generated)
 
     @property
     def lake_dir(self) -> Path:

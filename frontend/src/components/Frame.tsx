@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fx, pct, cls, timeIST } from "../lib/format";
+import { logout } from "../lib/auth";
 import { useLive, type DeskId } from "../lib/store";
 import { Icon } from "./ui";
 
@@ -10,9 +11,9 @@ export const DESKS: { id: DeskId; key: string; label: string; cmd: string }[] = 
   { id: "swing", key: "F4", label: "SWING", cmd: "SWING" },
   { id: "news", key: "F5", label: "NEWS", cmd: "NEWS" },
   { id: "alerts", key: "F6", label: "ALERTS", cmd: "ALRT" },
-  { id: "system", key: "F7", label: "SYSTEM", cmd: "SYS" },
-  { id: "geo", key: "F8", label: "GEO", cmd: "GEO" },
+  { id: "geo", key: "F7", label: "GEO", cmd: "GEO" },
 ];
+// SYSTEM and the history pulls live on the separate admin page (/admin), for admins only.
 
 const PHASE_LABEL: Record<string, string> = {
   OPEN: "MARKET OPEN", PRE_OPEN: "PRE-OPEN", PRE_OPEN_MATCH: "PRE-OPEN", POST_CLOSE: "POST-CLOSE", CLOSED: "CLOSED",
@@ -121,9 +122,28 @@ function GeoRiskChip() {
   const tone = risk.level === "SEVERE" ? "down" : risk.level === "HIGH" ? "amber" : risk.level === "ELEVATED" ? "warn" : "up";
   return (
     <button type="button" className={`geo-chip ${tone}`} onClick={() => setDesk("geo")}
-      title={`Geo-risk ${risk.value.toFixed(0)}/100 (${risk.level}) — main drivers: ${risk.drivers.join(", ")}. Open the GEO desk (F8).`}>
+      title={`Geo-risk ${risk.value.toFixed(0)}/100 (${risk.level}) — main drivers: ${risk.drivers.join(", ")}. Open the GEO desk (F7).`}>
       GEO RISK <b>{risk.value.toFixed(0)}</b> <span>{risk.level}</span>
     </button>
+  );
+}
+
+/** Who is logged in, the admin page (admins) and log out. Nothing in local mode (no accounts). */
+function UserMenu() {
+  const me = useLive((s) => s.me);
+  if (!me || !me.user) return null;
+  if (me.via === "local") {
+    // no accounts yet: the admin page leads to the first-admin setup (on the host) or explains .env
+    return <a className="btn admin-link" href="/admin" title="Set up accounts and open the admin page">ADMIN</a>;
+  }
+  return (
+    <div className="user-menu">
+      <span className="user-chip" title={me.via === "key" ? "Signed in with an access key" : `Signed in as ${me.user} (${me.role})`}>
+        {me.user}{me.role === "admin" ? <b> · admin</b> : null}
+      </span>
+      {me.admin && <a className="btn admin-link" href="/admin" title="Users, history pulls, system health">ADMIN</a>}
+      <button type="button" className="btn ghost" onClick={() => void logout()}>{me.via === "key" ? "Forget key" : "Log out"}</button>
+    </div>
   );
 }
 
@@ -163,6 +183,7 @@ export function TopBar() {
           <span className={`dot ${conn === "open" ? "on" : conn === "connecting" ? "wait" : "off"}`} />
           <span>{conn === "open" ? (latency !== null ? `${latency}ms` : "LIVE") : conn.toUpperCase()}</span>
         </span>
+        <UserMenu />
         <button type="button" className="btn icon-btn ghost" onClick={() => setHelp(true)} aria-label="Help and shortcuts"><Icon name="help" /></button>
       </div>
     </header>
@@ -175,10 +196,10 @@ export function Tabs() {
   const unread = useLive((s) => s.unreadAlerts);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const idx = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"].indexOf(e.key);
-      const alt = e.altKey && /^[1-8]$/.test(e.key) ? Number(e.key) - 1 : -1;
+      const idx = DESKS.findIndex((d) => d.key === e.key);
+      const alt = e.altKey && /^[1-9]$/.test(e.key) ? Number(e.key) - 1 : -1;
       const i = idx >= 0 ? idx : alt;
-      if (i >= 0) {
+      if (i >= 0 && i < DESKS.length) {
         e.preventDefault();
         setDesk(DESKS[i].id);
       }
@@ -261,9 +282,10 @@ export function HelpModal() {
         </header>
         <dl className="help-grid">
           <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the command line</dd>
-          <dt><kbd>F1</kbd>…<kbd>F8</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>8</kbd></dt><dd>Switch desk</dd>
+          <dt><kbd>F1</kbd>…<kbd>F7</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>7</kbd></dt><dd>Switch desk</dd>
           <dt>RELIANCE <kbd>GO</kbd></dt><dd>Load a symbol in the chart & depth</dd>
-          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · SYS · GEO</dt><dd>Open a desk</dd>
+          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO</dt><dd>Open a desk</dd>
+          <dt>ADMIN (top right)</dt><dd>Users, history pulls and system health — admins only</dd>
           <dt>CHAIN BANKNIFTY</dt><dd>Option chain for an underlying</dd>
           <dt>Click a row</dt><dd>Select the stock everywhere</dd>
         </dl>

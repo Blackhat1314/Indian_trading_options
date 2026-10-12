@@ -199,7 +199,7 @@ export default function SystemDesk() {
           <Empty>
             {source === "dhan"
               ? "Empty — auto history is downloading ~1 year of daily and 30 days of 1-minute bars (about 3 minutes)."
-              : <>Empty — run <code>python backfill/backfill.py run --intervals D,1 --years 5</code></>}
+              : <>Empty — pull it from the HISTORY tab, or run <code>python backfill/backfill.py run --intervals D,1 --years 5</code></>}
           </Empty>
         ) : (
           <table className="tbl">
@@ -215,8 +215,8 @@ export default function SystemDesk() {
           </table>
         )}
         <div className="banner">
-          Live mode tops this up by itself at start-up and every morning at 08:40 (AUTO_HISTORY). Run{" "}
-          <code>backfill.py</code> only for the full 5-year archive the research scripts use.
+          Live mode tops this up by itself at start-up and every morning at 08:40 (AUTO_HISTORY). The full 5-year
+          archive the research scripts use is pulled from the HISTORY tab.
         </div>
       </Panel>
     </div>
