@@ -23,9 +23,10 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    // xfwd: the gateway must see LAN visitors of the dev server as remote (login throttling, first-admin setup)
     proxy: {
-      "/api": GATEWAY,
-      "/ws": { target: GATEWAY.replace(/^http/, "ws"), ws: true },
+      "/api": { target: GATEWAY, xfwd: true },
+      "/ws": { target: GATEWAY.replace(/^http/, "ws"), ws: true, xfwd: true },
     },
   },
   build: {
