@@ -248,9 +248,19 @@ def test_run_lock():
         assert await b.holder() == "a" and not await b.refresh()
         await b.release()                     # not the owner: no effect
         assert await a.holder() == "a"
+        await r.flushall()                    # Redis restarted: the owner takes the lease back
+        assert await a.refresh() and await a.holder() == "a"
         await a.release()
         assert await b.acquire()
     run(go())
+
+
+def test_unreadable_state_is_kept(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text("{not json")
+    st = bf.load_state(p)
+    assert st == {"done": {}, "empty": {}, "failed": {}} and not p.exists()
+    assert len(list(tmp_path.glob("state.bad.*"))) == 1
 
 
 def _worker(monkeypatch, tmp_path):
@@ -333,50 +343,6 @@ def test_worker_restores_budget_floor(monkeypatch, tmp_path):
         w._usage = {}
         assert await w._floor() == 5000 and await w.budget.used() == 5000
     run(go())
-
-
-def test_admin_endpoints_modes(monkeypatch):
-    from fastapi.testclient import TestClient
-    from td.config import settings
-    from td.services import gateway as gw
-    r = fakeredis.aioredis.FakeRedis()
-    monkeypatch.setattr(gw.bus, "connect", lambda *a, **k: r)
-    monkeypatch.setattr(gw, "Lake", lambda *a, **k: None)
-    with TestClient(gw.app, client=("10.0.0.7", 5000)) as remote:          # no keys: closed to other machines
-        monkeypatch.setattr(settings, "access_keys", "")
-        monkeypatch.setattr(settings, "admin_key", "")
-        assert remote.get("/api/meta").json()["admin"] == "off"
-        assert remote.post("/api/admin/backfill/start", json={"intervals": ["D"]}).status_code == 403
-    with TestClient(gw.app, client=("127.0.0.1", 5000)) as c:
-        assert c.get("/api/meta").json()["admin"] == "open"
-        assert c.get("/api/admin/backfill").json()["status"] is None
-        assert c.post("/api/admin/backfill/start", json={"intervals": ["X"]}).status_code == 400
-        assert c.post("/api/admin/backfill/start", json={"intervals": ["D"], "years": 2}).json()["ok"]
-        cmd = json.loads(asyncio.run(r.rpop(gw.bus.KEY_ADMIN_CMD)))
-        assert cmd["op"] == "start" and cmd["job"]["years"] == 2 and cmd["by"] == "local"
-        # another website open in the same browser cannot start a pull (CORS is * by default)
-        evil = {"Origin": "https://evil.example"}
-        assert c.post("/api/admin/backfill/start", json={"intervals": ["D"]}, headers=evil).status_code == 403
-        assert c.post("/api/admin/backfill/stop", headers={"Origin": "null"}).status_code == 403
-        assert c.post("/api/admin/backfill/stop", headers={"Origin": "http://testserver"}).status_code == 403
-        rebind = {"Origin": "http://attacker.example:8000", "Host": "attacker.example:8000"}      # DNS rebinding
-        assert c.post("/api/admin/backfill/stop", headers=rebind).status_code == 403
-        assert c.post("/api/admin/backfill/stop", headers={"Origin": "http://localhost:5173"}).status_code == 200
-        # shared gateway without ADMIN_KEY: friends never reach the admin desk
-        monkeypatch.setattr(settings, "access_keys", "friend:k1")
-        h = {"X-Access-Key": "k1"}
-        assert c.get("/api/meta", headers=h).json()["admin"] == "off"
-        assert c.get("/api/admin/backfill", headers=h).status_code == 403
-        assert c.post("/api/admin/backfill/stop", headers=h).status_code == 403
-        # with ADMIN_KEY: required on top of the access key
-        monkeypatch.setattr(settings, "admin_key", "s3cret")
-        assert c.get("/api/admin/backfill", headers=h).status_code == 403
-        assert c.get("/api/admin/backfill", headers={**h, "X-Admin-Key": "nope"}).status_code == 403
-        assert c.get("/api/admin/backfill", headers={**h, "X-Admin-Key": "s3cret"}).status_code == 200
-        assert c.get("/api/admin/backfill", headers={"X-Admin-Key": "s3cret"}).status_code == 401
-        # behind a reverse proxy (Host rewritten) a valid admin key is enough
-        proxied = {**h, "X-Admin-Key": "s3cret", "Origin": "https://trade.example.com", "Host": "127.0.0.1:8000"}
-        assert c.post("/api/admin/backfill/stop", headers=proxied).status_code == 200
 
 
 def test_empty_long_range_is_not_recorded(tmp_path):

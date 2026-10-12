@@ -3,9 +3,8 @@ import type { CSSProperties } from "react";
 import { Empty, Icon, Kpi, Panel, Seg } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { dateIST, fx, timeIST } from "../lib/format";
-import { getPref, setPref } from "../lib/storage";
 
-/* ADMIN desk (F9): pull Dhan history into the lake through the backfill worker (td.services.backfiller).
+/* Admin page · HISTORY: pull Dhan history into the lake through the backfill worker (td.services.backfiller).
    The worker runs in its own process and paces itself around the live desks; this page only sends
    commands and shows its status. */
 
@@ -48,10 +47,7 @@ const STATE: Record<string, { label: string; tone: string }> = {
   waiting: { label: "WAITING", tone: "amber" }, starting: { label: "STARTING", tone: "" },
 };
 
-function adminApi<T>(path: string, init?: RequestInit): Promise<T> {
-  const key = getPref("td.adminKey");
-  return api<T>(path, { ...init, headers: { ...(init?.headers as Record<string, string>), ...(key ? { "X-Admin-Key": key } : {}) } });
-}
+const adminApi = api;
 
 const dur = (s: number | null | undefined) => {
   if (s === null || s === undefined) return "—";
@@ -71,29 +67,6 @@ function Meter({ done, total, label }: { done: number; total: number; label: str
       </div>
       <span className="mono right">{fx(done, 0)}/{fx(total, 0)}</span>
     </div>
-  );
-}
-
-function AdminKeyForm({ onSaved, wrong }: { onSaved: () => void; wrong: boolean }) {
-  const [key, setKey] = useState("");
-  const [bad, setBad] = useState(false);
-  return (
-    <form className="form" style={{ maxWidth: 520 }} onSubmit={(e) => {
-      e.preventDefault();
-      const k = key.trim();
-      if (!k) return;
-      if (!/^[\x21-\x7e]+$/.test(k)) { setBad(true); return; }
-      setBad(false);
-      setPref("td.adminKey", k);
-      onSaved();
-    }}>
-      <div className="field" style={{ gridColumn: "1 / -1" }}>
-        <label htmlFor="admin-key">Admin key</label>
-        <input id="admin-key" type="password" autoFocus value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" spellCheck={false} />
-        <span className={wrong || bad ? "err" : "hint"}>{bad ? "Keys are plain ASCII — check for smart quotes or dashes." : wrong ? "That key was not accepted." : "The ADMIN_KEY from the host's .env. Kept in this browser only."}</span>
-      </div>
-      <button type="submit" className="btn primary" style={{ justifySelf: "start", height: 30 }}>Unlock</button>
-    </form>
   );
 }
 
@@ -385,38 +358,24 @@ function LogPanel({ st }: { st: WorkerStatus | null }) {
   );
 }
 
-export default function AdminDesk() {
+export default function HistoryTab() {
   const [resp, setResp] = useState<AdminResp | null>(null);
   const [err, setErr] = useState<ApiError | null>(null);
   const [tick, setTick] = useState(0);
-  const [keyState, setKeyState] = useState<"none" | "checking" | "rejected">("none");
   useEffect(() => {
     let alive = true;
     const load = () =>
       adminApi<AdminResp>("/api/admin/backfill")
-        .then((r) => { if (alive) { setResp(r); setErr(null); setKeyState("none"); } })
-        .catch((e: ApiError) => {
-          if (!alive) return;
-          setErr(e instanceof ApiError ? e : new ApiError(0, String(e)));
-          setKeyState((k) => (k === "checking" ? "rejected" : k));
-        });
+        .then((r) => { if (alive) { setResp(r); setErr(null); } })
+        .catch((e: ApiError) => { if (alive) setErr(e instanceof ApiError ? e : new ApiError(0, String(e))); });
     load();
     const id = window.setInterval(load, 2000);
     return () => { alive = false; window.clearInterval(id); };
   }, [tick]);
   const reload = () => setTick((t) => t + 1);
 
-  if (err?.status === 403) {
-    const needKey = /admin key/i.test(err.message);
-    return (
-      <div className="desk desk-admin-locked">
-        <Panel code="ADMIN" title="Admin desk" pad>
-          {needKey ? (
-            <AdminKeyForm wrong={keyState === "rejected"} onSaved={() => { setKeyState("checking"); reload(); }} />
-          ) : <Empty>{err.message}</Empty>}
-        </Panel>
-      </div>
-    );
+  if (err && (err.status === 401 || err.status === 403)) {
+    return <div className="desk"><Empty>{err.message} — <a href="/login?next=/admin">log in as an admin</a>.</Empty></div>;
   }
   const st = resp?.status ?? null;
   return (

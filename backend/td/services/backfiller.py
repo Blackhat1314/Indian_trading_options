@@ -1,4 +1,4 @@
-"""BACKFILLER — downloads Dhan history into the lake for the ADMIN desk (F9), in its own process.
+"""BACKFILLER — downloads Dhan history into the lake for the admin page (/admin → HISTORY), in its own process.
 
 Kept apart from the live services on purpose: it never touches the market feed, runs at low CPU priority,
 takes a paced share of Dhan's 5 req/s data limit, leaves a reserve of the daily 7,000 calls for the
@@ -218,7 +218,10 @@ class Backfiller:
         while True:
             if self.halt.is_set() or self.stop.is_set():
                 raise bf.Stopped()
-            why = await self._pause_reason()
+            try:
+                why = await self._pause_reason()
+            except Exception as e:                # Redis restarting: wait, don't kill the pull
+                why = f"waiting for Redis ({type(e).__name__})"
             if why is None:
                 break
             self._set("paused", why)

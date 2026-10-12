@@ -9,7 +9,7 @@ Run:  uvicorn td.services.gateway:app --host 0.0.0.0 --port 8000
 from __future__ import annotations
 
 import asyncio
-import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import __version__, bus
+from ..auth import COOKIE, AuthError, Throttle, User, UserStore, seed_admin, session_token, verify
 from ..backfill import JobSpec
 from ..analytics import alerts as alerts_mod
 from ..analytics import smc
@@ -86,9 +87,10 @@ class Client:
 
     MAX_EVENTS = 200
 
-    def __init__(self, ws: WebSocket, user: str):
+    def __init__(self, ws: WebSocket, user: str, token: str | None = None):
         self.ws = ws
         self.user = user
+        self.token = token             # login session (re-checked: disabled / re-passworded users are cut off)
         self.topics: set[str] = set()
         self.queue: asyncio.Queue = asyncio.Queue()
         self.latest: dict[str, bytes] = {}
@@ -126,6 +128,7 @@ hub = Hub()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await asyncio.to_thread(seed_admin, users)
     await hub.start()
     app.state.redis = bus.connect()
     app.state.lake = Lake()
@@ -139,9 +142,13 @@ async def _status_loop(app):
     demand_key = f"td:demand:{os.getpid()}"
     while True:
         try:
-            users = sorted({c.user for c in hub.clients.values()})
+            for c in list(hub.clients.values()):
+                if c.token and verify(c.token, users) is None:
+                    c.token = None
+                    asyncio.create_task(c.ws.close(code=4401, reason="session ended"))
+            names = sorted({c.user for c in hub.clients.values()})
             await app.state.redis.set(bus.k_status(f"gateway:{os.getpid()}"), bus.dumps({
-                "pid": os.getpid(), "clients": len(hub.clients), "users": users, "msgs_out": hub.msgs_out,
+                "pid": os.getpid(), "clients": len(hub.clients), "users": names, "msgs_out": hub.msgs_out,
                 "updated": time.time()}), ex=15)
             # which geo views have viewers -> the GEO worker pauses feeds nobody is watching
             counts: dict[str, int] = {}
@@ -171,79 +178,136 @@ class FastJSON(Response):
 app = FastAPI(title="TradeDesk Gateway", version=__version__, default_response_class=FastJSON,
               lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=2048)
+# allow_headers deliberately leaves out X-TD-Request: other origins cannot send it, which is what makes it a
+# CSRF token for the login, admin and account endpoints (credentials are never allowed cross-origin either)
 app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
-                   allow_methods=["*"], allow_headers=["*"])
+                   allow_methods=["*"], allow_headers=["Content-Type", "Accept", "X-Access-Key"])
 
 
 # ------------------------------------------------------------------ auth
-def user_for_key(key: str | None) -> str:
-    keys = settings.access_key_map()
-    if not keys:
-        return "local"
-    if key and key in keys:
-        return keys[key]
-    raise HTTPException(401, "invalid or missing access key")
-
-
-def auth(request: Request) -> str:
-    key = request.headers.get("x-access-key") or request.query_params.get("key")
-    return user_for_key(key)
-
-
+# Who is asking, in order: a login session (cookie) · a legacy access key (?key= / X-Access-Key, ACCESS_KEYS) ·
+# "local" when no accounts and no keys are configured (localhost use, as before accounts existed).
+users = UserStore()
+throttle = Throttle()
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 
+def login_required() -> bool:
+    return bool(settings.access_key_map()) or users.count() > 0
+
+
+def identify(cookies, key: str | None) -> User | None:
+    u = verify(cookies.get(COOKIE), users)
+    if u:
+        return u
+    keys = settings.access_key_map()
+    if key and key in keys:
+        return User(keys[key], "viewer", via="key")
+    if not login_required():
+        return User("local", "viewer", via="local")
+    return None
+
+
+def current(request: Request) -> User:
+    u = identify(request.cookies, request.headers.get("x-access-key") or request.query_params.get("key"))
+    if not u:
+        raise HTTPException(401, "login required")
+    return u
+
+
+def auth(request: Request) -> str:
+    return current(request).name
+
+
+def _csrf(request: Request) -> None:
+    """State changes need X-TD-Request: a custom header cannot be sent cross-origin with the session cookie
+    (CORS does not allow credentials), on top of the SameSite=Lax cookie."""
+    if request.method not in ("GET", "HEAD") and request.headers.get("x-td-request") != "1":
+        raise HTTPException(403, "missing X-TD-Request header")
+
+
+def admin(request: Request) -> User:
+    """The /admin page: an admin's login session (access keys and local mode never qualify)."""
+    u = current(request)
+    if not u.is_admin:
+        raise HTTPException(403, "admin login required")
+    _csrf(request)
+    return u
+
+
+FORWARDED = ("x-forwarded-for", "forwarded", "x-real-ip", "cf-connecting-ip", "true-client-ip")
+
+
 def _local_client(request: Request) -> bool:
+    """The host itself. A reverse proxy or tunnel on the same machine also connects from 127.0.0.1, so any
+    forwarding header means the visitor is someone else."""
+    if any(h in request.headers for h in FORWARDED):
+        return False
     return bool(request.client and request.client.host in LOOPBACK)
 
 
-def _admin_mode(request: Request) -> str:
-    """Effective admin mode for this request: 'open' only for requests from this machine."""
-    mode = settings.admin_mode()
-    return "off" if mode == "open" and not _local_client(request) else mode
+def _local_host(request: Request) -> bool:
+    return urlsplit("//" + request.headers.get("host", "")).hostname in LOOPBACK
 
 
-def _same_site(request: Request) -> bool:
-    """CORS is open (*) by default, so a page on another site could otherwise make the browser POST here.
-    The Host header is not trusted (DNS rebinding); local origins and explicit CORS_ORIGINS are."""
-    origin = request.headers.get("origin")
+def _client_addr(request: Request) -> str:
+    """The visitor's address for login throttling: behind a proxy on this host or a private network (docker),
+    the first X-Forwarded-For hop; otherwise the TCP peer."""
+    peer = request.client.host if request.client else "?"
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        try:
+            if ipaddress.ip_address(peer).is_private or peer in LOOPBACK:
+                return fwd.split(",")[0].strip()[:64]
+        except ValueError:
+            pass
+    return peer
+
+
+def _origin_ok(origin: str | None, host: str | None, fwd_host: str | None = None) -> bool:
+    """Same origin as the page (or a local dev server / an explicit CORS_ORIGINS entry)."""
     if not origin:
-        return True                                   # scripts / curl / same-origin navigation
-    if urlsplit(origin).hostname in LOOPBACK:
-        return True                                   # the terminal on localhost or the Vite dev server
-    explicit = {o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip() not in ("", "*")}
-    return origin.rstrip("/") in explicit
+        return True
+    u = urlsplit(origin)
+    if u.hostname in LOOPBACK or (host and u.netloc == host):
+        return True
+    if fwd_host and u.netloc == fwd_host.split(",")[0].strip():
+        return True                    # behind a reverse proxy that rewrites Host
+    return origin.rstrip("/") in {o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip() not in ("", "*")}
 
 
-def admin(request: Request) -> str:
-    """ADMIN desk: history pulls spend the Dhan quota. Without keys it is open to this machine only; with
-    ACCESS_KEYS it needs ADMIN_KEY (and is off without one)."""
-    user = auth(request)
-    mode = _admin_mode(request)
-    if mode == "off":
-        raise HTTPException(403, "The admin desk is off here — it is open on the host itself (localhost); "
-                                 "set ADMIN_KEY in .env to use it from other machines")
-    if mode == "key":
-        given = (request.headers.get("x-admin-key") or "").encode()
-        if not hmac.compare_digest(given, settings.admin_key.encode()):
-            raise HTTPException(403, "admin key required")
-    elif request.method not in ("GET", "HEAD") and not _same_site(request):
-        raise HTTPException(403, "cross-site admin request blocked")      # (a valid admin key proves intent)
-    return user
+def _https(request: Request) -> bool:
+    return request.url.scheme == "https" or \
+        request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https"
+
+
+def _with_session(payload: dict, request: Request, name: str) -> Response:
+    resp = FastJSON(payload)
+    resp.set_cookie(COOKIE, session_token(name, users), max_age=int(settings.session_days * 86400), httponly=True,
+                    samesite="lax", secure=_https(request), path="/")
+    return resp
 
 
 # -------------------------------------------------------------- websocket
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, key: str | None = Query(None)):
-    try:
-        user = user_for_key(key)
-    except HTTPException:
+    who = identify(ws.cookies, key)
+    # (browsers cannot set X-Forwarded-Host on a websocket, so only a real proxy supplies it)
+    if who and who.via == "session" and not _origin_ok(ws.headers.get("origin"), ws.headers.get("host"),
+                                                         ws.headers.get("x-forwarded-host")):
+        # another site opening the socket with this browser's login cookie — or a proxy that hides the real
+        # host: a distinct code so the browser shows a hint instead of looping through /login
+        await ws.accept()
+        await ws.close(code=4403, reason="origin not allowed")
+        return
+    if not who:
         # accept then close, so browsers see code 4401 (a handshake rejection only shows 1006)
         await ws.accept()
-        await ws.close(code=4401, reason="invalid access key")
+        await ws.close(code=4401, reason="login required")
         return
+    user = who.name
     await ws.accept()
-    client = Client(ws, user)
+    client = Client(ws, user, ws.cookies.get(COOKIE) if who.via == "session" else None)
     cid = id(client)
     hub.clients[cid] = client
     sender = asyncio.create_task(client.sender())
@@ -283,11 +347,11 @@ async def ws_endpoint(ws: WebSocket, key: str | None = Query(None)):
 
 # ------------------------------------------------------------------- REST
 @app.get("/api/meta")
-async def meta(request: Request, user: str = Depends(auth)):
-    return {"version": __version__, "user": user, "source": settings.data_source, "plan": settings.dhan_plan,
+async def meta(who: User = Depends(current)):
+    return {"version": __version__, "user": who.name, "role": who.role, "source": settings.data_source,
+            "plan": settings.dhan_plan,
             "lock_time": settings.lock_time, "top_n": settings.top_n, "chains": settings.chain_list(),
-            "or_minutes": settings.or_minutes, "auth": bool(settings.access_key_map()),
-            "admin": _admin_mode(request),
+            "or_minutes": settings.or_minutes, "auth": login_required(),
             "geo": {"enabled": settings.geo_enabled, "mode": settings.geo_mode,
                     "disabled": sorted(settings.geo_disabled())}}
 
@@ -474,7 +538,7 @@ async def delete_alert(aid: str, user: str = Depends(auth)):
 
 
 @app.get("/api/system")
-async def system(user: str = Depends(auth)):
+async def system(who: User = Depends(admin)):
     r = app.state.redis
     keys = [k async for k in r.scan_iter(match="td:status:*")]
     vals = await r.mget(keys) if keys else []
@@ -505,8 +569,138 @@ async def system(user: str = Depends(auth)):
 
 
 @app.get("/api/lake/coverage")
-async def lake_coverage(user: str = Depends(auth)):
+async def lake_coverage(who: User = Depends(admin)):
     return await asyncio.to_thread(app.state.lake.coverage)
+
+
+# ------------------------------------------------------------------ accounts
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordIn(BaseModel):
+    old: str
+    new: str
+
+
+class UserIn(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+class UserPatch(BaseModel):
+    role: str | None = None
+    password: str | None = None
+    disabled: bool | None = None
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    """Who this browser is (no login needed): drives the login page, the terminal and the admin page."""
+    who = identify(request.cookies, request.headers.get("x-access-key") or request.query_params.get("key"))
+    none = users.count() == 0
+    return {"user": who.name if who else None, "role": who.role if who else None, "via": who.via if who else None,
+            "admin": bool(who and who.is_admin), "login_required": login_required(), "setup": none,
+            "can_setup": none and _local_client(request) and _local_host(request)}
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginIn, request: Request):
+    _csrf(request)
+    name = body.username.strip().lower()[:64]
+    addr = _client_addr(request)
+    keys = (f"ip:{addr}", f"user:{name}|{addr}")
+    if throttle.blocked(*keys):
+        raise HTTPException(429, "too many failed logins — try again in 15 minutes")
+    u = await asyncio.to_thread(users.authenticate, name, body.password)     # scrypt: off the event loop
+    if not u:
+        throttle.fail(*keys)
+        raise HTTPException(401, "wrong user name or password")
+    throttle.ok(keys[1])
+    await asyncio.to_thread(users.touch_login, name)
+    log.info("login: %s (%s)", name, u["role"])
+    return _with_session({"user": name, "role": u["role"]}, request, name)
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    _csrf(request)
+    resp = FastJSON({"ok": True})
+    resp.delete_cookie(COOKIE, path="/", httponly=True, samesite="lax", secure=_https(request))
+    return resp
+
+
+@app.post("/api/auth/setup")
+async def auth_setup(body: LoginIn, request: Request):
+    """First admin, while there are no accounts at all — only from the host itself (else ADMIN_USER in .env)."""
+    _csrf(request)
+    if users.count() or not _local_client(request) or not _local_host(request):
+        raise HTTPException(403, "setup is only open on the host itself (localhost) while there are no accounts")
+    try:
+        await asyncio.to_thread(users.create, body.username, body.password, "admin", "setup")
+    except AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    name = body.username.strip().lower()
+    return _with_session({"user": name, "role": "admin"}, request, name)
+
+
+@app.post("/api/auth/password")
+async def auth_password(body: PasswordIn, request: Request):
+    """Change your own password (ends your other sessions; this one is renewed)."""
+    _csrf(request)
+    who = current(request)
+    if who.via != "session":
+        raise HTTPException(403, "log in with a user account to change its password")
+    if not await asyncio.to_thread(users.authenticate, who.name, body.old):
+        raise HTTPException(401, "current password is wrong")
+    try:
+        await asyncio.to_thread(users.update, who.name, password=body.new, by=who.name)
+    except AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    return _with_session({"ok": True}, request, who.name)
+
+
+@app.get("/api/admin/users")
+async def admin_users(who: User = Depends(admin)):
+    r = app.state.redis
+    online: set[str] = set()
+    async for k in r.scan_iter(match=bus.k_status("gateway:*")):
+        st = bus.loads(await r.get(k))
+        online.update((st or {}).get("users", []))
+    return {"users": users.list(), "me": who.name, "online": sorted(online),
+            "access_keys": sorted(set(settings.access_key_map().values()))}
+
+
+@app.post("/api/admin/users")
+async def admin_user_create(body: UserIn, who: User = Depends(admin)):
+    try:
+        return await asyncio.to_thread(users.create, body.username, body.password, body.role, who.name)
+    except AuthError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.patch("/api/admin/users/{name}")
+async def admin_user_update(name: str, body: UserPatch, who: User = Depends(admin)):
+    if name.lower() == who.name and (body.disabled or (body.role and body.role != "admin")):
+        raise HTTPException(400, "you cannot disable or demote your own account (ask another admin)")
+    try:
+        return await asyncio.to_thread(users.update, name, role=body.role, password=body.password,
+                                       disabled=body.disabled, by=who.name)
+    except AuthError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.delete("/api/admin/users/{name}")
+async def admin_user_delete(name: str, who: User = Depends(admin)):
+    if name.lower() == who.name:
+        raise HTTPException(400, "you cannot delete your own account (ask another admin)")
+    try:
+        await asyncio.to_thread(users.delete, name, who.name)
+    except AuthError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ admin
@@ -527,23 +721,26 @@ def _spec(body: PullIn) -> dict:
 
 
 async def _admin_cmd(op: str, user: str, **extra) -> None:
-    await app.state.redis.lpush(bus.KEY_ADMIN_CMD, json.dumps({"op": op, "by": user, "ts": time.time(), **extra}))
-    await app.state.redis.expire(bus.KEY_ADMIN_CMD, 3600)
+    pipe = app.state.redis.pipeline(transaction=False)
+    pipe.lpush(bus.KEY_ADMIN_CMD, json.dumps({"op": op, "by": user, "ts": time.time(), **extra}))
+    pipe.ltrim(bus.KEY_ADMIN_CMD, 0, 99)
+    pipe.expire(bus.KEY_ADMIN_CMD, 3600)
+    await pipe.execute()
 
 
 @app.get("/api/admin/backfill")
-async def admin_backfill(user: str = Depends(admin)):
+async def admin_backfill(who: User = Depends(admin)):
     """Backfill worker status (None when the worker is not running)."""
     raw = await app.state.redis.get(bus.KEY_ADMIN_STATUS)
-    return {"status": json.loads(raw) if raw else None, "source": settings.data_source, "user": user}
+    return {"status": json.loads(raw) if raw else None, "source": settings.data_source, "user": who.name}
 
 
 @app.post("/api/admin/backfill/plan")
-async def admin_backfill_plan(body: PullIn, user: str = Depends(admin)):
+async def admin_backfill_plan(body: PullIn, who: User = Depends(admin)):
     """Ask the worker how many requests the pull still needs (it owns the resume state)."""
     spec = _spec(body)
     rid = uuid.uuid4().hex
-    await _admin_cmd("plan", user, id=rid, job=spec)
+    await _admin_cmd("plan", who.name, id=rid, job=spec)
     r = app.state.redis
     for _ in range(40):
         raw = await r.get(bus.k_admin_plan(rid))
@@ -555,21 +752,21 @@ async def admin_backfill_plan(body: PullIn, user: str = Depends(admin)):
 
 
 @app.post("/api/admin/backfill/start")
-async def admin_backfill_start(body: PullIn, user: str = Depends(admin)):
+async def admin_backfill_start(body: PullIn, who: User = Depends(admin)):
     spec = _spec(body)
-    await _admin_cmd("start", user, job=spec)
+    await _admin_cmd("start", who.name, job=spec)
     return {"ok": True, "job": spec}
 
 
 @app.post("/api/admin/backfill/stop")
-async def admin_backfill_stop(user: str = Depends(admin)):
-    await _admin_cmd("stop", user)
+async def admin_backfill_stop(who: User = Depends(admin)):
+    await _admin_cmd("stop", who.name)
     return {"ok": True}
 
 
 @app.post("/api/admin/backfill/coverage")
-async def admin_backfill_coverage(user: str = Depends(admin)):
-    await _admin_cmd("coverage", user)
+async def admin_backfill_coverage(who: User = Depends(admin)):
+    await _admin_cmd("coverage", who.name)
     return {"ok": True}
 
 
@@ -587,9 +784,16 @@ async def health():
 if FRONTEND.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND / "assets"), name="assets")
 
+    PAGES = {"login": "login.html", "admin": "admin.html"}
+
+    ROOT_DIST = FRONTEND.resolve()
+
     @app.get("/{path:path}")
     async def spa(path: str):
-        f = FRONTEND / path
-        if path and f.is_file():
+        f = (FRONTEND / path).resolve()
+        if path and f.is_relative_to(ROOT_DIST) and f.is_file():         # never serve files outside dist
             return FileResponse(f)
+        page = PAGES.get(path.strip("/").split("/")[0])
+        if page and (FRONTEND / page).is_file():
+            return FileResponse(FRONTEND / page)
         return FileResponse(FRONTEND / "index.html")

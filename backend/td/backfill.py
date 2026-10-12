@@ -1,5 +1,5 @@
 """History pulls from Dhan into the Parquet lake — the engine behind backfill/backfill.py (CLI) and the
-ADMIN desk's backfill worker (td.services.backfiller).
+admin page's backfill worker (td.services.backfiller, /admin → HISTORY).
 
 Resumable across days. Every finished request is remembered in data/backfill/state.json as the date range
 it covered, and a request is skipped (or shrunk to what is still missing) when earlier runs already covered
@@ -17,6 +17,7 @@ import errno
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections import deque
@@ -229,7 +230,9 @@ def load_state(path: Path | None = None) -> dict:
         try:
             st.update(json.loads(p.read_text()))
         except (OSError, ValueError):
-            log.warning("unreadable %s — starting a fresh backfill state", p)
+            bad = p.with_suffix(f".bad.{int(time.time())}")
+            p.replace(bad)                      # kept for inspection, never overwritten by the next save
+            log.warning("unreadable %s — moved to %s, starting a fresh backfill state", p, bad.name)
     for k in ("done", "empty", "failed"):
         st.setdefault(k, {})
     return st
@@ -268,7 +271,7 @@ def compact(st: dict, today: date) -> dict:
 def save_state(st: dict, path: Path | None = None) -> None:
     p = path or state_dir() / "state.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")       # per process: two writers never share a temp file
     tmp.write_text(json.dumps(st))
     tmp.replace(p)
 
@@ -624,9 +627,13 @@ class RunLock:
         return v.decode() if isinstance(v, bytes) else v
 
     async def refresh(self) -> bool:
-        if await self.holder() == self.owner:
+        """Extend the lease; if Redis lost the key (restart) take it back unless someone else holds it now."""
+        holder = await self.holder()
+        if holder == self.owner:
             await self.r.expire(LOCK_KEY, self.ttl)
             return True
+        if holder is None:
+            return await self.acquire()
         return False
 
     async def release(self) -> None:

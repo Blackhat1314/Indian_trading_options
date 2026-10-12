@@ -1,6 +1,6 @@
 """TradeDesk backfill — pulls up to 5 years of Dhan history into the shared Parquet lake.
 
-The same engine runs behind the ADMIN desk (F9) of the terminal, which is the easy way to do this: it pulls
+The same engine runs behind the admin page (/admin → HISTORY, admin login), which is the easy way to do this: it pulls
 in a background worker, paced so the live desks are not affected, and carries on by itself after midnight
 IST when a day's quota runs out. This CLI is for scripts and cron. Only one pull runs at a time (a Redis
 lock shared with the admin worker), and both resume from the same state (data/backfill/state.json).

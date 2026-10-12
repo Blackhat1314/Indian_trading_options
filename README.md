@@ -13,10 +13,13 @@ F3 F&O       futures OI build-up (LB / SB / SC / LU) · option chain with PCR, m
 F4 SWING     setup scanner (breakout, VCP, pullback, momentum, breakdown) · daily chart with EMA20/50 · setup receipts
 F5 NEWS      catalyst feed classified by event, direction and novelty · catalyst leaderboard
 F6 ALERTS    price / % / RVOL / VWAP / ORB / OI / news / top-list alerts · one-click alerts on the picks' stop & target
-F7 SYSTEM    health of every service · the ranker's own scorecard · walk-forward backtest · data-lake coverage
-F8 GEO       world map: live ships, chokepoints & ports, war/conflict events, refinery fires, military aircraft,
+F7 GEO       world map: live ships, chokepoints & ports, war/conflict events, refinery fires, military aircraft,
              satellite imagery · geo-risk index · oil & supply · India macro · market impact — every view switchable
-F9 ADMIN     pull the 5-year history from Dhan into the lake with one button · progress, quota, coverage per symbol
+
+/admin       a separate page for admins (log in at /login):
+  USERS      accounts (admin / viewer), passwords, who is online
+  HISTORY    pull the 5-year history from Dhan into the lake · progress, quota, coverage per symbol
+  SYSTEM     health of every service · the ranker's own scorecard · walk-forward backtest · data-lake coverage
 ```
 
 It runs out of the box on a built-in **simulator** that emits byte-identical Dhan packets, so you can
@@ -69,7 +72,7 @@ python run.py --speed 20      # simulator at 20×: a full session in ~20 minutes
 # open http://localhost:8000
 ```
 
-`run.py` starts the services (ingestor, analytics, geo, gateway, and the backfill worker behind the ADMIN desk),
+`run.py` starts the services (ingestor, analytics, geo, gateway, and the backfill worker behind /admin → HISTORY),
 prefixes their logs and stops them all on Ctrl+C. It rebuilds the UI by itself when the frontend sources are newer
 than the last build (e.g. after a `git pull`) and npm is installed.
 For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173).
@@ -98,10 +101,10 @@ For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173
    * today's 1-minute bars so far when you start after 09:15 → opening range and full charts
 
    The first run takes about 3 minutes and ~750 of the 7,000 daily calls; later days ~400. Progress is
-   on the SYSTEM desk (**Auto history**). If you start after 09:30 that day's picks can't be locked
+   on the admin page's SYSTEM tab (**Auto history**). If you start after 09:30 that day's picks can't be locked
    on time, so the Intraday desk shows a live ranking marked *provisional* and the day isn't scored.
-5. **Optional, for research**: the full 5-year archive for the walk-forward backtest — open the
-   **ADMIN desk (F9)** and press **Start pull** (below). When the token expires (Dhan shows the validity when you generate it), paste a
+5. **Optional, for research**: the full 5-year archive for the walk-forward backtest — open
+   **/admin → HISTORY** and press **Start pull** (below). When the token expires (Dhan shows the validity when you generate it), paste a
    fresh one into `.env` and restart the ingestor: `docker compose restart ingestor`.
 
 **Test the live path without an account or market hours**: `scripts/mock_dhan.py` is a local stand-in
@@ -114,9 +117,31 @@ the live system and the backfill), quotes 1/s, option chains 1 per 3 s per under
 
 ---
 
-## ADMIN desk (F9): pull the 5-year history
+## Logins and the admin page
 
-Open **F9 ADMIN**, choose what to pull (daily and/or 1-minute bars, 1–5 years, all F&O symbols or a list),
+TradeDesk has user accounts with two roles. **Viewers** use the terminal (`/`). **Admins** also open the
+separate admin page (`/admin`): USERS, HISTORY and SYSTEM.
+
+* **First admin.** Put `ADMIN_USER` and `ADMIN_PASSWORD` in `.env` and restart (needed for Docker and remote
+  servers). Or, on the host itself, open `http://localhost:8000/login` while no accounts exist: it offers a
+  one-time **Create the admin account** screen.
+* **Once any account exists, everyone logs in** at `/login`. Sessions last `SESSION_DAYS` (30). They're an HttpOnly
+  cookie signed with `data/auth/secret.key`, so they survive restarts. Passwords are scrypt-hashed in
+  `data/auth/users.json`.
+* **USERS tab**: add users (viewer or admin), change roles, set a new password, disable, or delete them. Disabling a user or
+  changing their password signs them out everywhere. The last admin can't be removed or demoted, and nobody
+  can disable or delete their own account.
+* **Access keys still work.** `ACCESS_KEYS` share links (`?key=…`) open the terminal for friends without
+  accounts, and `/login` has an "I have an access key" option. They never open `/admin`.
+* With no accounts and no access keys, the terminal is open as before (local use), but `/admin` always needs
+  an admin login.
+* **Behind a reverse proxy or tunnel** (nginx, Caddy, Cloudflare Tunnel): forward `Host` (or set
+  `X-Forwarded-Host`), `X-Forwarded-For` and `X-Forwarded-Proto`, and use `ADMIN_USER`/`ADMIN_PASSWORD` for the first
+  admin. The setup screen is switched off for requests that come through a proxy.
+
+## Admin page → HISTORY: pull the 5-year history
+
+Open **/admin → HISTORY**, choose what to pull (daily and/or 1-minute bars, 1–5 years, all F&O symbols or a list),
 check the preview — how many requests are still needed, how many calls are left today, how many days of
 quota it spans — and press **Start pull**. It runs wherever TradeDesk runs (your PC, a VPS, Docker), writes
 to that machine's lake, and the desk shows progress, the Dhan calls used today, every symbol's coverage and
@@ -127,16 +152,15 @@ The pull is done by the **backfill worker** (`python -m td.services.backfiller`,
 
 * **Paced**: 3 requests/s by default (Dhan allows 5/s in total), slowed to 1/s or paused in market hours
   (09:00–15:40 IST, your choice), and it waits while the ingestor loads its own history (start-up and 08:40).
-* **Quota-safe**: it shares the 7,000-calls/day budget with the live app and keeps a reserve (1,000 by
-  default) for it. When the rest is used it waits and **resumes by itself after midnight IST**; 5 years of
+* **Quota-safe**: it shares the 7,000-calls/day budget with the live app and keeps a reserve (2,500 by
+  default; at least 2,000, which is what the live app itself uses on a trading day) for it. When the rest is used it waits and **resumes by itself after midnight IST**; 5 years of
   1-minute bars for the whole F&O list is ~4,600 requests, so about a day and a half.
 * **Resumable**: what has been downloaded is remembered as date ranges (`data/backfill/state.json`), the job in
   `data/backfill/job.json`. A restart, a redeploy or Stop + Start carries on where it left off; ranges already
   in the lake are never fetched again.
 * **One at a time**: a Redis lock keeps the desk and `backfill/backfill.py` from pulling together.
 
-Access: with no `ACCESS_KEYS` (local use) the desk is open; on a shared gateway it is hidden unless you set
-`ADMIN_KEY` in `.env`, and then it asks for that key. Friends with access keys never see it otherwise.
+Only admin accounts can open it (see above).
 
 ## The 5-year backfill CLI (same engine, shared lake)
 
@@ -210,8 +234,10 @@ Docker: `docker compose run --rm tools python /app/backfill/backfill.py run --in
 3. Friends open the link once. The key is remembered in their browser, and a wrong key gets an
    access-key prompt.
 
-Never expose the gateway to the internet without `ACCESS_KEYS`. The ADMIN desk is switched off on a
-gateway with `ACCESS_KEYS` unless you also set `ADMIN_KEY`.
+Prefer user accounts (admin page → USERS) over access keys: each person gets their own login, and you can
+sign them out or remove them at any time. Never expose the gateway to the internet without accounts or
+`ACCESS_KEYS`, and put it behind https (Tailscale, Cloudflare Tunnel, a reverse proxy) so passwords and session
+cookies are encrypted.
 
 > **Check the terms first.** Dhan's API data is licensed for your own use, and NSE regulates
 > redistribution of real-time market data. Sharing a live feed with other people can count as
@@ -220,7 +246,7 @@ gateway with `ACCESS_KEYS` unless you also set `ADMIN_KEY`.
 
 ---
 
-## GEO desk (F8): world events that move Indian markets
+## GEO desk (F7): world events that move Indian markets
 
 A dark world map centred on India's trade routes. On the left there's one on/off switch per view. Switching a view
 off removes its map layer and panel and unsubscribes your browser from that feed. When nobody is watching ships or
@@ -282,7 +308,7 @@ now relative to the others*. It is never an absolute forecast.
   relative strength, and at most two picks per sector. If fewer than five stocks qualify, it
   **abstains** rather than forcing a pick.
 * At 15:30 the **scorecard** records the rank IC, how many picks finished in the day's top-5 and top-20,
-  the green %, and excess return vs the universe. This is the system's own track record, on the SYSTEM desk.
+  the green %, and excess return vs the universe. This is the system's own track record, on /admin → SYSTEM.
 
 ### Measure it before you trust it
 
@@ -364,7 +390,7 @@ Tests: `cd backend && python -m pytest -q`
 
 ## Troubleshooting
 
-* **Blank desks / "Waiting…"**: check the SYSTEM desk. INGESTOR and ANALYTICS should show UP.
+* **Blank desks / "Waiting…"**: check /admin → SYSTEM. INGESTOR and ANALYTICS should show UP.
   `docker compose logs -f ingestor analytics`.
 * **Dhan errors 806–810**: 806 data plan not active, 807 token expired, 808/809 authentication or invalid
   token, 810 wrong client ID. Usually a fresh token fixes it.
@@ -372,12 +398,12 @@ Tests: `cd backend && python -m pytest -q`
   Run large backfills with `--reserve 1500` on trading days, or on weekends.
 * **Ranking empty, breadth covers 2 stocks, NIFTY/BANKNIFTY missing from the top bar, F&O build-up
   all zeros, swing empty** (live mode): you're on a build older than the auto-history fix. Rebuild:
-  `docker compose up -d --build`, then watch **Auto history** on the SYSTEM desk reach READY (~3 min).
+  `docker compose up -d --build`, then watch **Auto history** on /admin → SYSTEM reach READY (~3 min).
 * **Option chain shows IV 0 / Δ 0 on deep in-the-money strikes**: Dhan returns 0 for strikes that barely
   trade; TradeDesk solves the IV from the last price. When that price is below intrinsic (stale) IV shows
   "—" and Δ shows ±1.
 * **RVOL looks wrong on day one**: the 1-minute history is missing, so a generic U-shaped volume curve
-  is used. Auto history fills it within a few minutes; check the SYSTEM desk.
+  is used. Auto history fills it within a few minutes; check /admin → SYSTEM.
 * **Redis memory**: the tick stream is capped by `STREAM_MAXLEN` (default 1,500 × 100 ms batches). History
   goes to `data/recorder` on disk.
 

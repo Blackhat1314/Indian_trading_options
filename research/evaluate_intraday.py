@@ -21,7 +21,7 @@ the live system has them. Treat this as a test of the price/volume core, not of 
   python research/evaluate_intraday.py --fit                   # IC-weighted weights, train/test split
   python research/evaluate_intraday.py --fit --write-weights   # save them for the live ranker
 
-The summary is also written to data/research/intraday_eval.json (shown on the SYSTEM desk).
+The summary is also written to data/research/intraday_eval.json (shown on /admin → SYSTEM).
 """
 from __future__ import annotations
 

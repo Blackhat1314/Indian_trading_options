@@ -7,7 +7,7 @@
     python run.py --build-ui      # rebuild the React app first (needs Node 20+)
 
 Starts the ingestor (the only live Dhan consumer), analytics, geo (world events), gateway and the backfill
-worker behind the ADMIN desk, and prefixes their logs. The backfill worker is optional: if it stops it is
+worker behind the admin page (/admin → HISTORY), and prefixes their logs. The backfill worker is optional: if it stops it is
 restarted and never takes the live services down. Redis must be reachable at REDIS_URL (default localhost:6379):
     docker run -d --name td-redis -p 6379:6379 redis:7-alpine
 Open http://localhost:8000 when the gateway says it is up. Ctrl+C stops everything.
@@ -139,7 +139,8 @@ def main() -> int:
 
     src = "SIMULATOR" if settings.data_source == "sim" else f"DHAN LIVE ({settings.dhan_plan} plan)"
     print(f"\n  TradeDesk · {src} · open http://localhost:{port}"
-          + ("   (access keys required)" if settings.access_keys else "") + "\n")
+          + ("   (access keys required)" if settings.access_keys else "")
+          + f"\n  Admin page (users, history pulls, system): http://localhost:{port}/admin\n")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
