@@ -4,11 +4,16 @@ No network: Dhan is an httpx.MockTransport, Redis is fakeredis, time is a fake c
 """
 import asyncio
 import base64
+import errno
+import importlib.util
 import json
 import logging
 import os
 import stat
+import threading
+import time
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -57,6 +62,7 @@ class FakeDhan:
         self.reject_new = False        # newly issued tokens fail /profile
         self.delay = 0.0
         self.gen_params: list[dict] = []
+        self.glitches: list[httpx.Response] = []   # answers for the next /profile calls, whatever the token
 
     def issue(self) -> str:
         t = jwt(self.clock[0] + 86400, self.clock[0])
@@ -72,6 +78,8 @@ class FakeDhan:
         bad = {"errorType": "Invalid_Authentication", "errorCode": "DH-901",
                "errorMessage": "Client ID or user generated access token is invalid or expired."}
         if path.endswith("/profile"):
+            if self.glitches:
+                return self.glitches.pop(0)
             if tok in self.valid:
                 return httpx.Response(200, json={"dhanClientId": CID, "tokenValidity": "16/10/2026 08:30",
                                                  "dataPlan": "Active", "dataValidity": "2026-12-01 00:00:00.0"})
@@ -167,10 +175,63 @@ def test_store_roundtrip_file_mode_and_restore(tmp_path):
         rec = await TokenStore(r).load()
         assert rec["token"] == t and rec["source"] == "renewed" and await r.get(tk.KEY_TOKEN)
         assert await r.ttl(tk.KEY_TOKEN) == -1                # no expiry on the key
-        newer = jwt(T(9, 0, 1))                               # a newer file copy (Redis write lost) wins
-        st._write(record(newer, "totp"))
+        newer = jwt(T(9, 0, 1))                               # a later saved file copy (Redis write lost) wins
+        st._write(record(newer, "totp", now=T(9)))
         assert (await st.load())["token"] == newer
     asyncio.run(go())
+
+
+def test_failed_file_write_never_brings_back_the_older_token(monkeypatch):
+    async def go():
+        clock = [T(10)]
+        r, dhan, k = setup(clock, role="follower")                  # the gateway, where the admin pastes
+        await k.store.save(record(jwt(T(8, 30, 1)), "renewed", now=T(8, 30)))   # since revoked by Dhan
+        await k._pick()
+        pasted = jwt(T(8, 0, 1), T(8, 0))                          # made on Dhan Web earlier: expires earlier
+
+        def full(rec):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        monkeypatch.setattr(k.store, "_write", full)
+        dhan.valid.add(pasted)
+        v = await k.adopt(pasted)
+        assert settings.dhan_access_token == pasted and v["source"] == "admin"
+        assert "not on disk" in v["last_error"] and "No space left" in v["last_error"]
+        assert (await TokenStore(r).load())["token"] == pasted     # the stale file copy does not win
+        clock[0] = T(10, 10)
+        await k.sync()
+        assert settings.dhan_access_token == pasted
+    asyncio.run(go())
+
+
+def test_concurrent_file_writes_never_corrupt_the_file(monkeypatch):
+    """Every container's process is PID 1 on the shared data mount: two writers must not share a temp file."""
+    st = TokenStore(None)
+    recs = [record(jwt(T(9, i, 1)), "renewed", now=T(9, i)) for i in range(2)]
+    errors: list[Exception] = []
+
+    def write(gate, rec):
+        gate.wait()
+        try:
+            st._write(rec)
+        except OSError as e:
+            errors.append(e)
+    for _ in range(40):
+        gate = threading.Barrier(2)
+        threads = [threading.Thread(target=write, args=(gate, rec)) for rec in recs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert json.loads(st.path.read_text()) in recs
+    assert not errors and os.listdir(st.path.parent) == [st.path.name]
+    assert stat.S_IMODE(os.stat(st.path).st_mode) == 0o600
+
+    def boom(*a):
+        raise OSError(errno.EIO, "I/O error")
+    monkeypatch.setattr(tk.os, "replace", boom)
+    with pytest.raises(OSError):
+        st._write(recs[0])
+    assert os.listdir(st.path.parent) == [st.path.name]          # no temp file left behind
 
 
 def test_best_token_choice():
@@ -362,6 +423,78 @@ def test_profile_rejecting_the_new_token_keeps_the_old_one():
     asyncio.run(go())
 
 
+RATE_LIMITED = {"errorType": "Rate_Limit", "errorCode": "DH-904", "errorMessage": "Too many requests"}
+
+
+def test_a_transient_profile_answer_is_not_a_refusal():
+    async def go():
+        clock = [T(10)]
+        settings.dhan_pin, settings.dhan_totp_secret = "4321", SECRET
+        tok = jwt(T(8, 30, 1), T(8, 30))
+        r, dhan, k = setup(clock, env=tok)
+        dhan.valid.add(tok)
+        await k._pick()
+        for glitch in (httpx.Response(400, json=RATE_LIMITED), httpx.Response(404, json={"detail": "Not Found"}),
+                       httpx.Response(429), httpx.Response(503)):
+            dhan.glitches.append(glitch)
+            clock[0] += tk.VERIFY_EVERY
+            await k.step()
+            assert "generateAccessToken" not in dhan.calls and settings.dhan_access_token == tok
+            assert k.view["state"] == "valid" and "Could not check" in k.view["last_error"]
+        clock[0] += tk.VERIFY_EVERY
+        await k.step()
+        assert k.view["state"] == "valid" and not k.view["last_error"]
+        dhan.valid.discard(tok)                                    # a real refusal still starts the TOTP login
+        clock[0] += tk.VERIFY_EVERY
+        await k.step()
+        assert dhan.calls.count("generateAccessToken") == 1 and settings.dhan_access_token == dhan.issued[-1]
+    asyncio.run(go())
+
+
+def test_a_renewed_token_survives_a_hiccup_on_its_check():
+    """RenewToken may retire the old token, so a hiccup while checking the new one must not throw it away."""
+    async def go():
+        clock = [T(14)]
+        old = jwt(T(15), T(15, 0, -1))
+        r, dhan, k = setup(clock, env=old)
+        dhan.valid.add(old)
+        await k._pick()
+        dhan.glitches.append(httpx.Response(400, json=RATE_LIMITED))   # once: the retry 2 s later gets through
+        await k.step(verify=False)
+        new = dhan.issued[-1]
+        assert old not in dhan.valid and settings.dhan_access_token == new and not k.view["last_error"]
+        assert (await TokenStore(r).load())["token"] == new and k.view["profile"]["dataPlan"]
+        clock[0] = T(12, 30, 1)                                    # next renewal: Dhan cannot be asked at all
+        dhan.glitches += [httpx.Response(404), httpx.Response(503)]
+        await k.step(verify=False)
+        assert dhan.calls.count("RenewToken") == 2 and settings.dhan_access_token == dhan.issued[-1] != new
+        assert (await TokenStore(r).load())["token"] == dhan.issued[-1]
+        assert "without a Dhan check" in k.view["last_error"] and k.view["state"] == "valid"
+    asyncio.run(go())
+
+
+def test_a_token_no_header_can_carry_is_reported_not_raised():
+    async def go():
+        clock = [T(10)]
+        r, dhan, k = setup(clock, env=jwt(T(8, 30, 1)) + "\u200b")   # copied into .env from a document
+        await k._pick()
+        await k.step()
+        st = json.loads(await r.get(tk.KEY_STATUS))
+        assert st["owner_updated"] == T(10) and st["state"] == "rejected" and "ASCII" in st["last_error"]
+        assert dhan.calls == []
+
+        def refuse(req):
+            raise httpx.LocalProtocolError("Illegal header value b'eyJhbGci.eyJpc3Mi\\nSECRETPART'")
+        k2 = TokenKeeper(r, http=httpx.AsyncClient(transport=httpx.MockTransport(refuse)))
+        for value in ("tok\u00e9n", "fine"):                       # httpx refuses it / h11 refuses it
+            got, body, err = await k2._call("GET", "https://api.dhan.test/v2/profile",
+                                            headers={"access-token": value})
+            assert got is None and body is None and err.startswith("invalid request")
+            assert "SECRET" not in err and "eyJ" not in err and "tok" not in err
+        await k2.http.aclose()
+    asyncio.run(go())
+
+
 def test_renew_errors_are_kept_and_retried_later():
     async def go():
         clock = [T(14)]
@@ -468,6 +601,52 @@ def test_follower_loop_picks_up_tokens(monkeypatch):
             await asyncio.sleep(0.01)
         await f.stop()
         assert settings.dhan_access_token == new
+    asyncio.run(go())
+
+
+def _backfill_cli():
+    """backfill/backfill.py is a script, not a package: load it from its file."""
+    path = Path(__file__).resolve().parents[2] / "backfill" / "backfill.py"
+    spec = importlib.util.spec_from_file_location("backfill_cli", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_backfill_cli_follows_the_kept_token(monkeypatch):
+    """`backfill.py update` from cron: the .env token lapsed on day 2, the ingestor's renewed one is stored."""
+    cli = _backfill_cli()
+    from td import bus
+    monkeypatch.setattr(tk, "TICK", 0.01)
+
+    async def go():
+        now = time.time()
+        r = fakeredis.aioredis.FakeRedis()
+        kept = jwt(now + 20 * 3600, now - 4 * 3600)
+        await TokenStore(r).save(record(kept, "renewed", now=now - 4 * 3600))
+        lapsed = jwt(now - 3600, now - 90000)
+        settings.dhan_access_token = lapsed
+        monkeypatch.setattr(bus, "connect", lambda *a, **k: r)
+        async with cli._Session() as ses:
+            assert ses.rest.access_token == kept and ses.rest._headers()["access-token"] == kept
+            renewed = jwt(now + 24 * 3600, now)                     # renewed by the ingestor during a long run
+            await TokenStore(r).save(record(renewed, "renewed", now=now + 1))
+            for _ in range(200):
+                if ses.rest.access_token == renewed:
+                    break
+                await asyncio.sleep(0.01)
+            assert ses.rest.access_token == renewed
+
+        class Down:
+            async def ping(self):
+                raise ConnectionError("Redis is down")
+        settings.dhan_access_token = lapsed
+        monkeypatch.setattr(bus, "connect", lambda *a, **k: Down())
+        async with cli._Session() as ses:                           # no Redis: the file copy
+            assert ses.redis is None and ses.rest.access_token == renewed
+        settings.dhan_access_token = ""                             # .env without a token: main() reads the file
+        await cli._stored_token()
+        assert settings.dhan_access_token == renewed
     asyncio.run(go())
 
 
@@ -623,14 +802,19 @@ def test_admin_endpoints(monkeypatch, tmp_path):
         for body, msg in (({"token": "hello"}, "not a Dhan access token"), ({}, "send JSON"),
                           ({"token": jwt(now + 9000, cid="999")}, "belongs to Dhan client 999"),
                           ({"token": jwt(now - 60)}, "expired"),
+                          ({"token": "\u201c" + new + "\u201d"}, "not plain ASCII"),       # curly quotes
+                          ({"token": new + "\u200b"}, "not plain ASCII"),                  # zero-width space
+                          ({"token": new + "!"}, "not a Dhan access token"),
                           ({"token": new}, "did not accept")):
             res = c.post("/api/admin/dhan-token", json=body, headers=H)
             assert res.status_code == 400 and msg in res.json()["detail"], (body, res.text)
             assert new not in res.text
         assert settings.dhan_access_token == env
         dhan.valid.add(new)
-        res = c.post("/api/admin/dhan-token", json={"token": "  " + new + "\n"}, headers=H)
-        assert res.status_code == 200 and new not in res.text and res.json()["source"] == "admin"
+        wrapped = "  " + new[:50] + "\n" + new[50:100] + "\r\n" + new[100:] + "\n"   # copied from a wrapped terminal
+        res = c.post("/api/admin/dhan-token", json={"token": wrapped}, headers=H)
+        assert res.status_code == 200 and res.json()["source"] == "admin"
+        assert new[:50] not in res.text and new[50:100] not in res.text and new.split(".")[1] not in res.text
         assert settings.dhan_access_token == new and (tmp_path / "auth" / "dhan_token.json").exists()
         # renew now
         res = c.post("/api/admin/dhan-token/renew", headers=H)

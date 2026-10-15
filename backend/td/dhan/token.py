@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import struct
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -69,6 +70,8 @@ RETRY_AFTER = 300           # a renewal that failed on the network / a Dhan hicc
 LOCK_TTL = 60
 RELOAD = 300                # a follower re-reads the store at least this often, version bump or not
 INTERNAL = ("rejected_fp", "token_fp", "retry_at", "gen_blocked", "error_op", "owner_updated")
+RATE_CODES = {"DH-904", "805", "RL001"}   # Dhan's rate-limit answers, whatever the HTTP status (as in rest.py)
+JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
 
 class TokenError(Exception):
@@ -228,6 +231,13 @@ def _error_text(status: int, body: Any, text: str) -> str:
     return f"HTTP {status} {text.strip()[:200]}".strip()
 
 
+def _unsure(status: int | None, body: Any) -> bool:
+    """A failure that says nothing about the token: network, rate limit, Dhan down, or no such route (a wrong
+    DHAN_BASE_URL, the mock server). Any other 4xx is Dhan refusing it."""
+    code = str(body.get("errorCode") or "") if isinstance(body, dict) else ""
+    return status is None or status in (404, 408, 429) or status >= 500 or code in RATE_CODES
+
+
 def _renew_time() -> dtime:
     try:
         h, m = settings.dhan_token_renew_at.strip().split(":")[:2]
@@ -250,15 +260,16 @@ class TokenStore:
     (owner-only file mode) because Docker's Redis keeps nothing across a restart."""
 
     def __init__(self, redis, path: Path | str | None = None):
-        self.r = redis
+        self.r = redis                         # None: the file only (a script without Redis)
         self.path = Path(path) if path else Path(settings.data_dir) / "auth" / "dhan_token.json"
         self._bad_file = False
+        self.file_error = ""                   # why the last save could not write the file
 
     async def load(self) -> dict | None:
-        """The fresher of the Redis and file copies; a lost Redis key is restored from the file."""
-        cached, redis_ok = None, True
+        """The later saved of the Redis and file copies; a lost Redis key is restored from the file."""
+        cached, redis_ok = None, self.r is not None
         try:
-            raw = await self.r.get(KEY_TOKEN)
+            raw = await self.r.get(KEY_TOKEN) if redis_ok else None
             cached = _clean(bus.loads(raw)) if raw else None
         except ValueError:
             pass
@@ -272,7 +283,8 @@ class TokenStore:
                     await self.r.incr(KEY_VER)
             except Exception:
                 log.debug("token store: restore to Redis failed", exc_info=True)
-        if cached and disk and disk["token"] != cached["token"] and (disk["exp"] or 0) > (cached["exp"] or 0):
+        # by save time, not expiry: a file a later save could not overwrite must not bring back the older token
+        if cached and disk and disk["token"] != cached["token"] and (disk["saved_at"] or 0) > (cached["saved_at"] or 0):
             return disk
         return cached or disk
 
@@ -283,8 +295,10 @@ class TokenStore:
             raise ValueError("empty token record")
         try:
             await asyncio.to_thread(self._write, rec)
+            self.file_error = ""
         except OSError as e:
-            log.error("cannot write %s (%s) — the token lives in Redis only until this is fixed", self.path, e)
+            self.file_error = f"cannot write {self.path} ({e})"
+            log.error("%s — the token lives in Redis only until this is fixed", self.file_error)
         await self.r.set(KEY_TOKEN, bus.dumps(rec))
         await self.r.incr(KEY_VER)
 
@@ -306,14 +320,18 @@ class TokenStore:
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         with contextlib.suppress(OSError):
             os.chmod(d, 0o700)
-        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(rec, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        # a temp file of its own (0600, O_EXCL): every container's process is PID 1 on the shared data mount
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{self.path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(rec, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
 
 # ------------------------------------------------------------------- keeper
@@ -452,7 +470,7 @@ class TokenKeeper:
         read again when td:dhan:token:ver moves, and every few minutes for a save that only reached the file."""
         now = self.clock()
         try:
-            ver = await self.r.get(KEY_VER)
+            ver = await self.r.get(KEY_VER) if self.r is not None else None
         except Exception:
             ver = None
         if (ver is not None and ver == self._ver and now - self._loaded_at < RELOAD and self.current
@@ -671,7 +689,7 @@ class TokenKeeper:
             now = self.clock()
             if not new:
                 err = err or "Dhan's answer had no token"
-                if st is not None and 400 <= st < 500 and st != 429:
+                if st is not None and st >= 400 and not _unsure(st, body):
                     ok, _, perr = await self._profile(tok)
                     if ok is False:
                         msg = f"Dhan rejected the token: {perr}"
@@ -684,7 +702,7 @@ class TokenKeeper:
                 msg = f"Renewal failed: {err}"
                 log.warning(msg)
                 await self._note(retry_at=now + RETRY_AFTER, last_error=msg, error_op="renew")
-                return False, msg, 502 if st is None or st >= 500 or st == 429 else 400
+                return False, msg, 502 if _unsure(st, body) else 400
             hint = _when(_field(body, "expiryTime")) if (new == tok or expires_at(new) is None) else None
             await self._hold_lock()
             try:
@@ -778,6 +796,9 @@ class TokenKeeper:
             fields.update(last_check=now, profile=prof)
         else:
             fields.update(last_error=f"New token saved without a Dhan check ({err})", error_op="check")
+        if self.store.file_error:
+            fields.update(last_error=f"{self.store.file_error} — the new token is not on disk, so a Redis restart "
+                                     "would lose it", error_op="store")
         if source in ("renewed", "totp"):
             fields["last_renew"] = now
         await self._note(**fields)
@@ -788,10 +809,14 @@ class TokenKeeper:
         """Admin paste: a JWT for DHAN_CLIENT_ID that is not expired and that Dhan accepts → saved and applied."""
         token = token.strip() if isinstance(token, str) else ""
         if token.lower().startswith("bearer "):
-            token = token[7:].strip()
+            token = token[7:]
+        token = "".join(token.split())                  # a copy wrapped over several lines, as the page does
         if not token:
             raise TokenError("paste the access token")
-        if len(token) > 4096 or claims(token) is None:
+        if not token.isascii():
+            raise TokenError("the token contains characters that are not plain ASCII (curly quotes, invisible "
+                             "spaces…) — copy it again")
+        if len(token) > 4096 or not JWT.fullmatch(token) or claims(token) is None:
             raise TokenError("that is not a Dhan access token (expected a JWT: three base64 parts separated by dots)")
         exp = expires_at(token)
         if exp is not None and exp <= self.clock() + MARGIN:
@@ -837,6 +862,10 @@ class TokenKeeper:
         """(HTTP status, JSON body, error text). Network problems come back as status None and never raise."""
         try:
             r = await self.http.request(method, url, **kw)
+        except (httpx.LocalProtocolError, httpx.InvalidURL, ValueError) as e:
+            # the request could not be built (e.g. a header value that is not ASCII / has a line break): the
+            # message would quote the header, i.e. the token, in an escaped form _scrub cannot find
+            return None, None, f"invalid request ({type(e).__name__})"
         except httpx.HTTPError as e:
             return None, None, self._scrub(f"network error ({type(e).__name__}: {e})", *secrets)
         try:
@@ -852,10 +881,12 @@ class TokenKeeper:
     async def _profile(self, token: str) -> tuple[bool | None, dict | None, str]:
         """GET /profile with `token`: (True, plan info) · (False, why) when Dhan refuses it · (None, why) unsure."""
         cid = str(settings.dhan_client_id or "")
+        if not re.fullmatch(r"[\x21-\x7e]+", token):      # no HTTP header can carry it, so Dhan never would
+            return False, None, "the token contains spaces or characters that are not plain ASCII"
         st, body, err = await self._call("GET", f"{_base()}/profile", token,
                                          headers={"access-token": token, "client-id": cid,
                                                   "Accept": "application/json"})
-        if st is None or st == 429 or st >= 500:
+        if _unsure(st, body):
             return None, None, err or f"HTTP {st}"
         if st >= 400:
             return False, None, err

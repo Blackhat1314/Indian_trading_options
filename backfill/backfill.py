@@ -69,11 +69,13 @@ def _jobs(universe: Universe, intervals: list[str], years: float, symbols: set[s
 
 class _Session:
     """One CLI pull: Redis (the daily budget shared with the live ingestor), the pull lock shared with the admin
-    worker, and a Dhan client. `stop` is set if the lock is lost, so two pulls never write together."""
+    worker, the token the ingestor keeps renewed, and a Dhan client. `stop` is set if the lock is lost, so two
+    pulls never write together."""
 
     async def __aenter__(self) -> "_Session":
         from td.bus import connect
         from td.dhan.rest import DhanRest
+        from td.dhan.token import TokenKeeper
 
         self.redis = None
         try:
@@ -90,6 +92,10 @@ class _Session:
             await self.redis.aclose()
             sys.exit(f"Another pull is running ({holder}). Stop it on the admin page or wait for it to finish.")
         self.keeper = asyncio.create_task(self._keep()) if self.lock else None
+        # DHAN_ACCESS_TOKEN in .env lapses after a day: follow the stored one (Redis, else data/auth), also when
+        # it is renewed during a long run; DhanRest reads it on every call
+        self.tokens = TokenKeeper(self.redis, role="follower")
+        await self.tokens.start()
         self.rest = DhanRest(redis=self.redis, budget_file=STATE_DIR / "budget.json")
         return self
 
@@ -108,6 +114,7 @@ class _Session:
     async def __aexit__(self, *exc) -> None:
         if self.keeper:
             self.keeper.cancel()
+        await self.tokens.stop()
         await self.rest.close()
         if self.lock:
             await self.lock.release()
@@ -198,6 +205,13 @@ async def _options(ses: "_Session", underlyings: list[str], strikes: int, years:
     return out
 
 
+async def _stored_token() -> None:
+    """Apply the token stored in data/auth (the one the ingestor renews), if any."""
+    from td.dhan.token import TokenKeeper
+
+    await TokenKeeper(None, role="follower").sync()
+
+
 def cmd_plan(args, universe):
     intervals = args.intervals.split(",")
     jobs = _jobs(universe, intervals, args.years, _symbols(args))
@@ -271,13 +285,15 @@ def main():
         print(f"synthetic lake written to {lake.root}")
         return
 
+    if settings.dhan_client_id and not settings.dhan_access_token:
+        asyncio.run(_stored_token())         # .env may hold none once the token was pasted on /admin
     if not settings.dhan_client_id or not settings.dhan_access_token:
         if args.cmd == "plan":
             from td.universe_data import FNO_STOCKS
             print("(no Dhan credentials yet — estimating from the built-in F&O list)")
             cmd_plan(args, sim_universe(len(FNO_STOCKS)))
             return
-        sys.exit("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env first.")
+        sys.exit("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env first (or paste a token on /admin → SYSTEM).")
     universe = dhan_universe()
 
     if args.cmd == "plan":

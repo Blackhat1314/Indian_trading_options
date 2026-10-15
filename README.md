@@ -141,9 +141,10 @@ running deployment never needs a daily paste:
   so renewals land about once a day, outside market hours. Each new token is checked with Dhan (`/profile`,
   same client id, no data-API quota) before it is used; a refused one leaves the old token in place.
 * **Every service follows.** The current token lives in Redis and in `data/auth/dhan_token.json` (file mode 0600,
-  because Docker's Redis keeps nothing across restarts). The gateway, the backfill worker and the ingestor's REST
-  calls pick up a new token within 30 s, and the websockets reconnect with it within seconds. On start-up the token
-  with the latest expiry wins, so an old `DHAN_ACCESS_TOKEN` left in the environment no longer hides a newer one.
+  because Docker's Redis keeps nothing across restarts). The gateway, the backfill worker, `backfill/backfill.py`
+  and the ingestor's REST calls pick up a new token within 30 s, and the websockets reconnect with it within
+  seconds. On start-up the token with the latest expiry wins, so an old `DHAN_ACCESS_TOKEN` left in the
+  environment no longer hides a newer one.
 * **After downtime.** Dhan renews only a token that is still valid. If the server was off long enough for it to
   lapse, paste a new one on **/admin → SYSTEM → DHAN TOKEN** (no restart needed), or let the app log in by itself:
   enable TOTP on Dhan Web (DhanHQ Trading APIs → Setup TOTP), then put your Dhan PIN in `DHAN_PIN` and the text
@@ -273,6 +274,8 @@ python backfill/backfill.py status                                   # coverage 
 python backfill/backfill.py sim                                      # synthetic lake for the simulator
 ```
 
+It uses the token the ingestor keeps renewed (Redis, else `data/auth/dhan_token.json`), not the one in `.env`,
+so a daily cron run keeps working after the first day.
 5- and 15-minute bars are resampled from 1-minute bars on the fly, so `D,1` is all you need.
 Daily bars take one request per symbol (Dhan returns 10+ years at once); 1-minute bars 90 days per request.
 `--rate` (default 3/s) and `--reserve` (default 800 calls) keep room for the live system.
