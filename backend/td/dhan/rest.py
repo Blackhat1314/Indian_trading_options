@@ -3,6 +3,8 @@
 Every call goes through the shared rate limiters so the whole system respects
 Dhan's limits: data 5/s + 7,000/day, quotes 1/s (1,000 instruments per call),
 option chain 1 per 3 s per underlying and max 10 unique underlyings per 8 s.
+With `redis`, the per-second limits and the daily budget are shared by every process
+(ingestor, gateway, backfill worker, backfill CLI): Dhan counts them per account.
 """
 from __future__ import annotations
 
@@ -14,10 +16,12 @@ from typing import Any
 import httpx
 
 from ..config import settings
-from ..ratelimit import BudgetExhausted, DailyBudget, SlidingWindowUnique, TokenBucket
+from ..ratelimit import BudgetExhausted, DailyBudget, SharedRate, SlidingWindowUnique, TokenBucket
 from .constants import DATA_API_ERRORS
 
 log = logging.getLogger("td.dhan.rest")
+
+RATE_CODES = {"RL001", "DH-904", "805"}          # Dhan's "too many requests" answers (besides HTTP 429)
 
 
 class DhanError(RuntimeError):
@@ -37,6 +41,10 @@ class DhanRest:
                                        limits=httpx.Limits(max_connections=10))
         self.data_bucket = TokenBucket(settings.limit_data_per_sec)
         self.quote_bucket = TokenBucket(settings.limit_quote_per_sec)
+        # per-second pacing shared through Redis with every other process on this account (the buckets above
+        # pace this process alone when there is no Redis or it errors)
+        self.limits = {"data": SharedRate(redis, "data", settings.limit_data_per_sec, fallback=self.data_bucket),
+                       "quote": SharedRate(redis, "quote", settings.limit_quote_per_sec, fallback=self.quote_bucket)}
         self.chain_window = SlidingWindowUnique(settings.limit_chain_unique_per_8s, 8.0, 3.0)
         self.data_budget = DailyBudget("dhan_data", settings.limit_data_per_day, redis=redis, file=budget_file)
         self.calls = {"data": 0, "quote": 0, "chain": 0, "errors": 0}
@@ -61,13 +69,13 @@ class DhanRest:
             raise DhanError("DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not configured")
         if kind == "data":
             await self.data_budget.consume(1)
-            await self.data_bucket.acquire()
-        elif kind == "quote":
-            await self.quote_bucket.acquire()
+        limit = self.limits.get(kind)        # option chains are paced by chain_window in the caller
         self.calls[kind] = self.calls.get(kind, 0) + 1
         delay = 1.0
         last_status = None
         for attempt in range(retries):
+            if limit is not None:
+                await limit.acquire()        # every attempt is a request at Dhan, retries included
             try:
                 r = await self._http.post(self.base + path, json=payload, headers=self._headers())
             except httpx.HTTPError as e:
@@ -77,7 +85,12 @@ class DhanRest:
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
-            if r.status_code == 429 or (r.status_code >= 500 and attempt < retries - 1):
+            if r.status_code == 429:
+                self.calls["errors"] += 1
+                last_status = r.status_code
+                delay = await self._rate_limited(limit, delay)
+                continue
+            if r.status_code >= 500 and attempt < retries - 1:
                 self.calls["errors"] += 1
                 last_status = r.status_code
                 await asyncio.sleep(delay)
@@ -95,13 +108,26 @@ class DhanRest:
                     msg = DATA_API_ERRORS.get(int(code), msg) if code is not None else msg
                 except (TypeError, ValueError):
                     pass
-                if (code in ("RL001", "DH-904", 805, "805")) and attempt < retries - 1:
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
+                if str(code) in RATE_CODES:
+                    delay = await self._rate_limited(limit, delay, attempt < retries - 1)
+                    if attempt < retries - 1:
+                        continue
                 raise DhanError(f"{path}: {msg}", code=code, status=r.status_code)
+            if limit is not None:
+                await limit.relax()
             return body
         raise DhanError(f"{path}: retries exhausted", status=last_status)
+
+    @staticmethod
+    async def _rate_limited(limit: SharedRate | None, delay: float, retrying: bool = True) -> float:
+        """Dhan answered "too many requests": a pause shared by every process (the next acquire waits it out)
+        rather than each retrying on its own. Returns the next backoff delay for the unshared case."""
+        if limit is not None:
+            await limit.penalize()
+            return delay
+        if retrying:
+            await asyncio.sleep(delay)
+        return delay * 2
 
     # ------------------------------------------------------------------ quotes
     async def quote(self, instruments: dict[str, list[int]], mode: str = "quote") -> dict:

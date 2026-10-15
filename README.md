@@ -127,6 +127,9 @@ strikes. The run commands are in the script's docstring.
 
 Rate limits are enforced in code: 5 data calls/s, 7,000/day (a budget shared through Redis between
 the live system and the backfill), quotes 1/s, option chains 1 per 3 s per underlying and expiry.
+Dhan counts the per-second limits per account, so they are shared too: the ingestor, the gateway, the backfill
+worker and the CLI reserve their turns in Redis (`td:rl:*`, one queue, at most 5 calls in any second), and a
+429 pauses all of them briefly; without Redis each process paces itself.
 
 ---
 
@@ -488,7 +491,7 @@ backend/td/
   research/            research desks: tsmath (GARCH, Kalman, HMM, bootstrap…) · montecarlo · quant ·
                        screener (Screener.in) · llm (Claude / OpenAI-compatible) · ai (the analyst) · data
   lake.py              Parquet lake (+ DuckDB coverage)
-  ratelimit.py         token buckets, daily budget, option-chain window
+  ratelimit.py         token buckets, per-second limits shared across processes (Redis), daily budget, option-chain window
 backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker, news, swing, lake, geo parsers & rules, live-mode regressions,
                        Dhan token keeper (renewal, TOTP, followers, admin API),
                        research maths, Monte Carlo calibration, quant causality, Screener parser, AI client & analyst, research API)
