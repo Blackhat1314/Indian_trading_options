@@ -731,13 +731,17 @@ function StatePanel({ symbol, loading, error, retry, view }: { symbol: string; l
     );
   }
   if (error) {
+    const upstream = error instanceof ApiError && error.status === 502;
+    const busy = error instanceof ApiError && /^Screener\.in: busy\b/i.test(error.message);
     return (
       <Panel code="FUND" title="Fundamentals" className="scr-state" sub={symbol}>
         <ErrorNote error={error} onRetry={retry} />
         <p className="scr-note">
-          {error instanceof ApiError && error.status === 502
-            ? "Screener.in did not answer and the gateway holds no earlier copy of this company. Try again in a minute."
-            : "The fundamentals could not be loaded."}
+          {busy
+            ? "The gateway asks Screener.in for one page every few seconds and enough companies are already waiting, so this one was not queued. Nothing is wrong with the symbol; try again in a minute."
+            : upstream
+              ? "Screener.in did not answer and the gateway holds no earlier copy of this company. Try again in a minute."
+              : "The fundamentals could not be loaded."}
         </p>
       </Panel>
     );

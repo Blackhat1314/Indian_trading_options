@@ -32,6 +32,14 @@ Honesty rules built in
   bootstrap: stocks co-move and h-day labels overlap, so 130k test rows hold only a few dozen independent market
   swings), held ≥ 0.5 in every fold and kept a calibration spread. Without one the signal is NEUTRAL with low
   confidence and the reason travels with the result — the probability itself is still reported as estimated.
+- A horizon whose calibration spread fell below MIN_CALIB_B is "flat": its probabilities were shrunk to the base
+  rate, so every stock gets that base rate (`flat` in the result), the expected return is 0 with the median at spot,
+  the leaderboard returns no ranking for it (the raw scores the calibration discarded are not a ranking) and the
+  1-month contributions are left out (the displayed probability does not depend on them). Contributions are
+  otherwise reported on the calibrated log-odds scale (b·coef·x), i.e. their real effect on the shown P(up).
+- The regime the desk SHOWS is not the model's causal HMM feature: it is fitted on the latest window with the Monte
+  Carlo desk's own recipe (`display_regime`), so both desks name the same state, and it carries its fit window. The
+  model's bull-probability feature keeps its fixed pre-evaluation fit (its fit end travels with the result too).
 
 Price ranges come from a GARCH(1,1)-t forecast of the h-day variance; the expected log return is
 (2·p_up − 1)·E|r_h| — a direction model says nothing about size beyond that. Pure functions do the math
@@ -59,6 +67,7 @@ import pandas as pd
 from ..config import settings
 from ..timeutil import from_epoch
 from ..universe_data import INDICES, SECTOR_OF
+from . import montecarlo as _mc
 from . import tsmath as tm
 
 log = logging.getLogger("td.research.quant")
@@ -90,6 +99,7 @@ MIN_FOLDS = 4
 ALPHA0 = 0.005                     # L2 strength per horizon day (see module docstring)
 
 HMM_MIN_FIT, HMM_MAX_FIT, HMM_FIRST_FIT = 250, 756, 504
+REGIME_YEARS = 5.0                 # displayed regime: the Monte Carlo desk's default calibration window
 GARCH_WINDOW = 756
 
 # Kalman local linear trend on log price, noise variances in units of the local daily return variance. Only the
@@ -896,17 +906,29 @@ def _garch(r: np.ndarray) -> _Vol | None:
     return _Vol(fit=fit, fc=tm.garch11_forecast(fit, max(HORIZONS)), cond=tm.garch11_filter(fit, x))
 
 
+def is_flat(hm: HorizonModel | None) -> bool:
+    """The walk-forward calibration shrank this horizon to its base rate: every stock gets the same P(up)."""
+    return hm is not None and hm.calib_b < MIN_CALIB_B
+
+
 def _horizon(h: int, p: float, vol: _Vol, spot: float, hm: HorizonModel | None) -> dict:
     sd = math.sqrt(float(vol.fc[:h].sum()))
-    # E|r_h| ≈ σ_h·√(2/π) (normal approximation of the mean absolute h-day log return), and with the size of the
-    # move independent of its sign, E[r_h] ≈ (2·p_up − 1)·E|r_h|. The distribution is taken symmetric around it,
-    # so this is also the median log return.
-    m = (2.0 * p - 1.0) * sd * math.sqrt(2.0 / math.pi)
+    flat = is_flat(hm)
+    if flat:
+        # the calibrated probability is (≈) the training base rate for every stock; report exactly that, and no
+        # direction or size tilt: the base rate says nothing about this stock, so the median stays at spot
+        p, m = hm.base, 0.0
+    else:
+        # E|r_h| ≈ σ_h·√(2/π) (normal approximation of the mean absolute h-day log return), and with the size of
+        # the move independent of its sign, E[r_h] ≈ (2·p_up − 1)·E|r_h|. The distribution is taken symmetric
+        # around it, so this is also the median log return.
+        m = (2.0 * p - 1.0) * sd * math.sqrt(2.0 / math.pi)
     nu = h_day_nu(vol.fit.nu, h)
     q68, q95 = unit_t_quantile(0.8413447460685429, nu), unit_t_quantile(0.975, nu)
     met = hm.metrics if hm else {}
     auc = met.get("auc")
-    edge, note = edge_status(met)
+    # the stored spread decides (the metrics keep it rounded), so a flat horizon never claims an edge
+    edge, note = edge_status({**met, "calib_b": hm.calib_b} if hm else met)
     # without a measured edge the probability is still the honest estimate, but it is no call on the stock
     signal = ("UP" if p >= UP_P else "DOWN" if p <= DOWN_P else "NEUTRAL") if edge else "NEUTRAL"
     tilt = abs(p - 0.5)
@@ -923,7 +945,7 @@ def _horizon(h: int, p: float, vol: _Vol, spot: float, hm: HorizonModel | None) 
             "range95": [round(spot * math.exp(m - q95 * sd), 2), round(spot * math.exp(m + q95 * sd), 2)],
             "price_median": round(spot * math.exp(m), 2), "signal": signal, "confidence": conf,
             "oos_auc": auc, "oos_acc": met.get("acc"), "base_rate": met.get("base_rate"),
-            "edge": edge, "edge_note": note}
+            "edge": edge, "edge_note": note, "flat": flat}
 
 
 def _model_inputs(model: QuantModel | None, symbol: str, df: pd.DataFrame,
@@ -953,6 +975,58 @@ def score_symbol(model: QuantModel, symbol: str, df: pd.DataFrame, index_df: pd.
     return out
 
 
+@dataclass
+class DisplayRegime:
+    """The regime the desk shows (not the model's feature): a 2-state HMM on the latest window."""
+    hmm: tm.GaussianHMM
+    ts: np.ndarray                   # bar ts of each return in the window
+    probs: np.ndarray                # (T, 2) filtered P(state) per return, state 1 = bull (higher mean)
+    var_scale: float                 # state variances × this = the window's variance (the fit winsorises outliers)
+    start_ts: int                    # first and last price bar of the window
+    end_ts: int
+
+    def bull_at(self, ts: np.ndarray) -> np.ndarray:
+        """Filtered bull probability at each bar ts (the last return on or before it), NaN before the window."""
+        j = np.searchsorted(self.ts, ts, side="right") - 1
+        out = self.probs[np.maximum(j, 0), -1].astype(float)
+        out[j < 0] = np.nan
+        return out
+
+    def to_dict(self, model_fit_end_ts: int | None) -> dict:
+        h = self.hmm
+        bp = float(self.probs[-1, -1])
+        state = "bull" if bp >= 0.65 else "bear" if bp <= 0.35 else "sideways"
+        return {"state": state, "labels": ["bear", "bull"], "probs": [round(1.0 - bp, 4), round(bp, 4)],
+                "mu_annual": [round(float(m) * TRADING_DAYS, 4) for m in h.means],
+                "vol_annual": [round(math.sqrt(float(v) * self.var_scale * TRADING_DAYS), 4) for v in h.vars],
+                "expected_duration": [round(1.0 / max(1.0 - float(h.trans[i, i]), 1e-6), 1)
+                                      for i in range(h.n_states)],
+                "fit_start": _date(self.start_ts), "fit_end": _date(self.end_ts),
+                "fit_years": round((self.end_ts - self.start_ts) / YEAR_S, 2),
+                "model_fit_end": _date(model_fit_end_ts) if model_fit_end_ts is not None else None}
+
+
+def display_regime(df: pd.DataFrame, years: float = REGIME_YEARS) -> DisplayRegime:
+    """The Monte Carlo desk's regime model on the same bars, so the two desks name the same state today: its price
+    series (bad prints dropped), its calibration window (the last `years`, at least a year of bars) and its HMM fit
+    (GaussianHMM(2), 100 EM iterations, seed 0, clip_z 6, state variances scaled to the window's). A stock with
+    under a year of bars, which the Monte Carlo cannot simulate, is fitted on all of them. ValueError when the
+    fit fails. Fitted on data up to today, so unlike the model's own bull-probability feature it is not causal —
+    it describes the current state; it never feeds the forecast."""
+    s = _mc._series(df)
+    end = s.ts.size - 1
+    if end < 60:
+        raise ValueError("too little history for a regime model")
+    try:
+        start, _ = _mc._window(s, end, years)
+    except ValueError:
+        start = 0
+    r = np.diff(np.log(s.close[start:end + 1]))
+    f = _mc._fit(r, "regime")
+    return DisplayRegime(hmm=f.hmm, ts=s.ts[start + 1:end + 1], probs=f.hmm.filter(r), var_scale=f.hmm_scale,
+                         start_ts=int(s.ts[start]), end_ts=int(s.ts[end]))
+
+
 def _tone(v: float, up: float, down: float) -> str:
     return "up" if v >= up else "down" if v <= down else "neutral"
 
@@ -961,8 +1035,9 @@ def _pct(x: float, nd: int = 1) -> str:
     return f"{x * 100:+.{nd}f} %"
 
 
-def _components(fe: Features, vol: _Vol | None, symbol: str = "") -> list[dict]:
-    """The model's main ingredients as readable gauges for the desk (latest bar)."""
+def _components(fe: Features, vol: _Vol | None, symbol: str = "", regime: dict | None = None) -> list[dict]:
+    """The model's main ingredients as readable gauges for the desk (latest bar). The regime gauge reads the
+    displayed regime (`display_regime`, latest window), so it agrees with the regime panel and the Monte Carlo."""
     zrow = fe.z[-1]
     raw = fe.raw[-1]
     out: list[dict] = []
@@ -999,12 +1074,13 @@ def _components(fe: Features, vol: _Vol | None, symbol: str = "") -> list[dict]:
             f"Price is {abs(z_ou):.1f} sd {side} its Kalman trend; such gaps have halved in about {hl:.0f} "
             "trading days over the last year.", _tone(-z_ou, 1, -1))
 
-    bp = fe.bull_prob[-1]
-    if math.isfinite(bp):
+    if regime is not None:
+        bp = float(regime["probs"][-1])
         state = "bull" if bp >= 0.65 else "bear" if bp <= 0.35 else "sideways: neither regime dominates"
         add("regime", "HMM regime", bp, f"{bp * 100:.0f} % bull", None,
-            f"A 2-state hidden Markov model of daily returns puts {bp * 100:.0f} % on the higher-return regime "
-            f"({state}).", _tone(bp, 0.65, 0.35))
+            f"A 2-state hidden Markov model of the daily returns from {regime['fit_start']} to {regime['fit_end']} "
+            f"puts {bp * 100:.0f} % on the higher-return (bull) regime — today's state: {state}.",
+            _tone(bp, 0.65, 0.35))
 
     if vol is not None:
         now_v = math.sqrt(float(vol.fc[0]) * TRADING_DAYS)
@@ -1072,6 +1148,7 @@ def predict(model: QuantModel | None, symbol: str, df: pd.DataFrame, index_df: p
     missing = [FEATURE_LABEL[k] for k, ok in zip(FEATURE_KEYS, np.isfinite(zrow)) if not ok]
     horizons: list[dict] = []
     contributions: list[dict] = []
+    contributions_flat = False
     stock_metrics: list[dict] = []
     usable = len(missing) <= 2 and np.isfinite(zrow[[FI["mom_12_1"], FI["ma_200"]]]).all()
     if model is not None and vol is not None and usable:
@@ -1084,9 +1161,13 @@ def predict(model: QuantModel | None, symbol: str, df: pd.DataFrame, index_df: p
                 warnings.append(f"{H_LABELS[h]}: {hz['edge_note']}")
             horizons.append(hz)
         hm = model.horizons.get(21)
-        if hm is not None:
+        if is_flat(hm):
+            contributions_flat = True                      # the shown 1-month P(up) does not depend on any input
+        elif hm is not None:
             x = np.where(np.isfinite(zrow), (np.nan_to_num(zrow) - hm.mean) / hm.sd, 0.0)
-            contrib = hm.coef * x                          # raw model log-odds (before the calibration spread)
+            # effect on the CALIBRATED log-odds that the desk shows: calibration multiplies the raw model's log-odds
+            # (relative to its base rate) by the spread b, so each term moves logit P(up) by b·coef·x
+            contrib = hm.calib_b * hm.coef * x
             for j in np.argsort(-np.abs(contrib))[:10]:
                 contributions.append({"feature": FEATURE_KEYS[j], "label": FEATURE_LABEL[FEATURE_KEYS[j]],
                                       "value": round(float(x[j]), 3), "contribution": round(float(contrib[j]), 4)})
@@ -1098,17 +1179,12 @@ def predict(model: QuantModel | None, symbol: str, df: pd.DataFrame, index_df: p
         warnings.append(f"{sym} needs about {FEATURE_WARMUP + 1} daily bars (≈ 1.3 years) for the model's "
                         f"standardised features; it has {n}")
 
-    regime = None
-    if fe.hmm is not None and math.isfinite(fe.bull_prob[-1]):
-        hmm = fe.hmm
-        bp = float(fe.bull_prob[-1])
-        probs = (1.0 - bp, bp)
-        state = "bull" if bp >= 0.65 else "bear" if bp <= 0.35 else "sideways"
-        regime = {"state": state, "labels": ["bear", "bull"], "probs": [round(float(p), 4) for p in probs],
-                  "mu_annual": [round(float(m) * TRADING_DAYS, 4) for m in hmm.means],
-                  "vol_annual": [round(math.sqrt(float(v) * TRADING_DAYS), 4) for v in hmm.vars],
-                  "expected_duration": [round(1.0 / max(1.0 - float(hmm.trans[i, i]), 1e-6), 1)
-                                        for i in range(hmm.n_states)]}
+    regime, disp = None, None
+    try:
+        disp = display_regime(df)
+        regime = disp.to_dict(fe.hmm_fit_end_ts if model is not None and fe.hmm is not None else None)
+    except ValueError as e:
+        warnings.append(f"regime model unavailable ({e})")
 
     vol_out = None
     if vol is not None:
@@ -1127,7 +1203,7 @@ def predict(model: QuantModel | None, symbol: str, df: pd.DataFrame, index_df: p
     ok = np.isfinite(lv) & np.isfinite(lse)
     if ok.any():
         tsl = fe.ts[tail][ok]
-        bpl = fe.bull_prob[tail][ok]
+        bpl = disp.bull_at(tsl) if disp is not None else np.full(tsl.size, np.nan)
         chart = {"ts": [int(t) for t in tsl], "close": [round(float(x), 2) for x in fe.close[tail][ok]],
                  "trend": [round(float(x), 2) for x in np.exp(lv[ok])],
                  "upper": [round(float(x), 2) for x in np.exp(lv[ok] + 2 * lse[ok])],
@@ -1151,8 +1227,9 @@ def predict(model: QuantModel | None, symbol: str, df: pd.DataFrame, index_df: p
                                           "lo95": round(spot * math.exp(m - q95 * sd), 2),
                                           "hi95": round(spot * math.exp(m + q95 * sd), 2)})
     return {"symbol": sym, "asof": _date(fe.ts[-1]), "spot": round(spot, 2), "horizons": horizons,
-            "components": _components(fe, vol, sym), "contributions": contributions, "regime": regime,
-            "vol": vol_out, "chart": chart, "stock_metrics": stock_metrics, "warnings": warnings}
+            "components": _components(fe, vol, sym, regime), "contributions": contributions,
+            "contributions_flat": contributions_flat, "regime": regime, "vol": vol_out, "chart": chart,
+            "stock_metrics": stock_metrics, "warnings": warnings}
 
 
 # --------------------------------------------------------------------------- service
@@ -1375,7 +1452,7 @@ class QuantService:
         info = await self.info()
         model = self._model
         if model is None:
-            return {"h": h, "asof": "", "up": [], "down": [], "model": info}
+            return {"h": h, "asof": "", "up": [], "down": [], "model": info, "flat": False, "base_p": None}
         board = self._board
         fresh = board is not None and board[1] == model.trained_at
         if not fresh:
@@ -1386,15 +1463,25 @@ class QuantService:
         elif time.monotonic() - board[0] > self.BOARD_TTL and (self._board_task is None or self._board_task.done()):
             self._board_task = asyncio.create_task(self._refresh_board(model))     # serve stale, refresh behind
         table = self._board[2] if self._board else {"asof": "", "rows": []}
+        hm = model.horizons.get(h)
+        flat = is_flat(hm)
+        out = {"h": h, "asof": table["asof"], "up": [], "down": [], "model": info, "flat": flat,
+               "base_p": round(hm.base, 4) if hm is not None else None}
+        out["edge"], out["edge_note"] = edge_status(hm.metrics if hm is not None else None)
+        if flat:
+            # every stock has the same calibrated P(up) (the base rate); ordering them by the raw score that the
+            # walk-forward calibration discarded would present noise as a ranking
+            out["edge"] = False
+            out["edge_note"] = (f"probabilities are flattened to the base rate at this horizon — every stock gets "
+                                f"P(up) = {hm.base:.1%}, so there is no ranking")
+            return out
         rows = [r for r in table["rows"] if h in r["h"]]
-        # ties in the calibrated p_up (a horizon shrunk to its base rate) are ordered by the raw model score
+        # remaining ties in the calibrated p_up (rounded to 4 decimals) are ordered by the raw model score
         rows.sort(key=lambda r: (-r["h"][h]["p_up"], -r["h"][h]["score"], r["symbol"]))
         lead = [{"symbol": r["symbol"], "sector": r["sector"], "close": r["close"], "p_up": r["h"][h]["p_up"],
                  "exp_ret": r["h"][h]["exp_ret"], "signal": r["h"][h]["signal"]} for r in rows]
         n = max(1, int(n))
-        out = {"h": h, "asof": table["asof"], "up": lead[:n], "down": lead[::-1][:n], "model": info}
-        met = model.horizons[h].metrics if h in model.horizons else None
-        out["edge"], out["edge_note"] = edge_status(met)
+        out["up"], out["down"] = lead[:n], lead[::-1][:n]
         return out
 
     async def _refresh_board(self, model: QuantModel) -> None:

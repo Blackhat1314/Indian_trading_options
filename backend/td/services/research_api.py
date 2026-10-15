@@ -119,6 +119,8 @@ def _fail(what: str, e: Exception, missing: bool = True) -> HTTPException:
     if isinstance(e, Unavailable):
         return HTTPException(503, _msg(e))
     if type(e).__name__ == "ScreenerError":
+        if getattr(e, "busy", False):                # our own queue is full, Screener.in itself is fine
+            return HTTPException(503, f"Screener.in: {_msg(e)}", headers={"Retry-After": "30"})
         return HTTPException(502, f"Screener.in: {_msg(e)}")
     if isinstance(e, ValueError):                    # e.g. too little history for the requested lookback
         log.info("%s rejected: %s", what, e)

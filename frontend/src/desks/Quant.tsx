@@ -43,11 +43,15 @@ function edgeOf(auc: number | null | undefined, edge?: boolean | null): { word: 
 }
 const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
 
-function SignalChip({ s }: { s: Signal }) {
+/** `noEdge`: the horizon has no reliable edge, so the signal is NEUTRAL whatever P(up) says. */
+function SignalChip({ s, noEdge = false }: { s: Signal; noEdge?: boolean }) {
   if (s === "UP") return <span className="chip up" title="P(up) ≥ 55 %">▲ UP</span>;
   if (s === "DOWN") return <span className="chip down" title="P(up) ≤ 45 %">▼ DOWN</span>;
-  return <span className="chip" title="P(up) between 45 % and 55 %">• NEUTRAL</span>;
+  return <span className="chip" title={noEdge ? "No call: the model has no reliable edge at this horizon" : "P(up) between 45 % and 55 %"}>• NEUTRAL</span>;
 }
+
+/** ProbBar's lean band, widened to the whole scale where the horizon has no edge: no "leans up / down" colour. */
+const NO_LEAN: [number, number] = [0, 1];
 
 // ------------------------------------------------------------------ fetching (cached across desk switches)
 const TTL = 5 * 60_000;
@@ -165,18 +169,19 @@ function ResultGate({ q, what, children, main = false }: { q: Fetched<QuantResul
 function MoveCard({ h, stock, symbol }: { h: QuantHorizon; stock: QuantResult["stock_metrics"][number] | undefined; symbol: string }) {
   const ex = extra(h);
   const e = edgeOf(h.oos_auc, ex.edge);
-  const weak = e.none;
+  const flat = !!h.flat;                                 // calibration flattened P(up) to the base rate for every stock
+  const weak = e.none || flat;
   const naive = ok(h.base_rate) ? Math.max(h.base_rate, 1 - h.base_rate) : null;
   const usual = ok(h.base_rate) && h.base_rate < 0.5 ? "down" : "up";
   return (
     <article className={`qt-card ${weak ? "weak" : ""}`} aria-label={`${h.label} outlook`}>
       <header className="qt-card-head">
         <span className="qt-card-h">{h.label}</span>
-        <SignalChip s={h.signal} />
+        <SignalChip s={h.signal} noEdge={weak} />
         <span className={`chip ${h.confidence === "high" ? "cyan" : h.confidence === "medium" ? "violet" : ""}`}
           title="Confidence combines how far P(up) is from 50 % with the model's walk-forward AUC at this horizon">{h.confidence.toUpperCase()} CONF.</span>
       </header>
-      <ProbBar p={h.p_up} width={150} />
+      <ProbBar p={h.p_up} width={150} neutral={weak ? NO_LEAN : undefined} />
       <dl className="qt-kv">
         <div><dt>Expected return</dt><dd><Ret v={h.exp_ret} d={2} /> <small className="muted">±{fracPct(h.ret_sd, 1)} sd</small></dd></div>
         <div><dt>Median price</dt><dd>{inr(h.price_median)}</dd></div>
@@ -194,8 +199,11 @@ function MoveCard({ h, stock, symbol }: { h: QuantHorizon; stock: QuantResult["s
       </div>
       {weak && (
         <p className="qt-noedge" role="note">
-          ⚠ {ex.edge_note ? cap(ex.edge_note) : "No reliable edge at this horizon — past forecasts were barely better than a coin flip"}.
-          Read P(up) as ≈ 50/50; the price ranges still describe the risk.
+          ⚠ {ex.edge_note ? cap(ex.edge_note) : "No reliable edge at this horizon — past forecasts were barely better than a coin flip"}.{" "}
+          {flat
+            ? <>P(up) is the base rate ({pctOf(h.p_up, 1)}, the share of rises over the whole training sample) for every stock at this horizon: walk-forward calibration flattened the model's
+                scores, so it says nothing specific about {symbol}. Expected return is 0 and the median is today's price; the ranges still describe the risk.</>
+            : "Read P(up) as ≈ 50/50; the price ranges still describe the risk."}
         </p>
       )}
     </article>
@@ -279,8 +287,8 @@ function ChartPanel({ q }: { q: Fetched<QuantResult> }) {
         {(r) => !m ? <Empty>No chart data for {r.symbol}{r.status === "training" ? " while the model trains" : ""}.</Empty> : (
           <LineChart label={`${r.symbol}: daily close, Kalman trend and the quant model's 21-day forecast range`} x={m.x}
             series={m.series} bands={m.bands} shade={m.shade} marks={m.marks} height="fill" busy={q.loading}
-            caption={<>Kalman trend = the noise-filtered price level (shaded ± 2 standard errors).
-              {m.shade ? " Background tint = probability the stock is in its bull regime (darker = more likely)." : ""}{" "}
+            caption={<>Kalman trend = the noise-filtered price level (shaded: ± 2 standard deviations of the price around the trend over the past year).
+              {m.shade ? ` Background tint = probability the stock is in its bull regime${r.regime?.fit_start ? ` (HMM fitted on ${r.regime.fit_start} → ${r.regime.fit_end}, as on the Monte Carlo desk)` : ""}; darker = more likely.` : ""}{" "}
               {m.fut ? "The cone is the model's 68 % / 95 % range for the next 21 trading days around its median — it widens with GARCH volatility." : "No forecast cone (no volatility forecast for this stock)."}</>} />
         )}
       </ResultGate>
@@ -298,6 +306,7 @@ function RegimePanel({ q }: { q: Fetched<QuantResult> }) {
           const named = g ? g.labels.indexOf(g.state) : -1;      // "sideways" = no state is likely enough to name
           const cur = g ? (named >= 0 ? named : g.probs.reduce((best, p, i) => (p > (g.probs[best] ?? -1) ? i : best), 0)) : 0;
           const pctile = v && ok(v.percentile) ? frac01(v.percentile) : null;
+          const fitSpan = g?.fit_start && g.fit_end ? ` from ${g.fit_start} to ${g.fit_end}` : "";
           return (
             <>
               {g ? (
@@ -305,12 +314,12 @@ function RegimePanel({ q }: { q: Fetched<QuantResult> }) {
                   <p className="qt-lead">
                     {named >= 0 ? (
                       <>
-                        A hidden-state (HMM) model fitted to {r.symbol}'s daily returns puts <b>{pctOf(g.probs[cur])}</b> on the{" "}
+                        A hidden-state (HMM) model fitted to {r.symbol}'s daily returns{fitSpan} puts <b>{pctOf(g.probs[cur])}</b> on the{" "}
                         <b className={g.state === "bull" ? "up" : g.state === "bear" ? "down" : undefined}>{g.state}</b> regime today
                       </>
                     ) : (
                       <>
-                        A hidden-state (HMM) model fitted to {r.symbol}'s daily returns is undecided today — <b>sideways</b>:{" "}
+                        A hidden-state (HMM) model fitted to {r.symbol}'s daily returns{fitSpan} is undecided today — <b>sideways</b>:{" "}
                         {g.labels.map((l, k) => `${pctOf(g.probs[k])} ${l}`).join(" vs ")}. It leans <b>{g.labels[cur]}</b>
                       </>
                     )}
@@ -331,6 +340,13 @@ function RegimePanel({ q }: { q: Fetched<QuantResult> }) {
                       ))}
                     </tbody>
                   </table>
+                  {g.fit_end && (
+                    <p className="qt-note">
+                      States are named by their average return over that window{ok(g.fit_years) ? ` (${fx(g.fit_years, 1)} years)` : ""}, the same fit as the
+                      Monte Carlo desk's regime model, so the two desks agree.
+                      {g.model_fit_end && ` The quant model's own regime input is a separate HMM fitted once on returns up to ${g.model_fit_end} (kept fixed so its walk-forward test never saw later data), so the value the model uses can differ from this one.`}
+                    </p>
+                  )}
                 </>
               ) : <Empty>No regime estimate for {r.symbol} (too little history).</Empty>}
               {v ? (
@@ -406,10 +422,16 @@ function ContributionsPanel({ q }: { q: Fetched<QuantResult> }) {
     .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution)).slice(0, 10), [list]);
   const max = Math.max(1e-9, ...top.map((c) => Math.abs(c.contribution)));
   const net = top.reduce((a, c) => a + c.contribution, 0);
+  const b21 = q.data?.model.metrics.find((m) => m.h === 21)?.calib_b;
   return (
-    <Panel code="WHY" title="Why it leans that way" area="contrib" sub="1-month model · top 10 pushes, in log-odds">
+    <Panel code="WHY" title="Why it leans that way" area="contrib" sub="1-month P(up) · top 10 pushes, in calibrated log-odds">
       <ResultGate q={q} what="the model's reasoning">
-        {(r) => !top.length ? <Empty>{r.status === "ready" ? "No contributions for this stock." : "Contributions appear once the model is trained."}</Empty> : (
+        {(r) => r.contributions_flat ? (
+          <p className="qt-note warn" role="note">
+            The 1-month probability does not depend on these inputs: walk-forward calibration flattened it to the base rate
+            {ok(b21) ? ` (spread b = ${fx(b21, 2)})` : ""}, so every stock gets the same P(up) and nothing pushes it up or down.
+          </p>
+        ) : !top.length ? <Empty>{r.status === "ready" ? "No contributions for this stock." : "Contributions appear once the model is trained."}</Empty> : (
           <>
             <ul className="qt-contrib" aria-label="Contributions to the 1-month log-odds of a rise">
               {top.map((c: QuantContribution) => (
@@ -424,8 +446,9 @@ function ContributionsPanel({ q }: { q: Fetched<QuantResult> }) {
               ))}
             </ul>
             <p className="qt-note">
-              Each bar = the model's weight × today's standardised reading. ▲ pushes toward UP, ▼ toward DOWN; near 50 % a push of 0.1 moves
-              P(up) by about 2.5 points. Net of these ten: <b className={net >= 0 ? "up" : "down"}>{net >= 0 ? "▲ +" : "▼ "}{fx(net, 3)}</b>.
+              Each bar = the model's weight × today's standardised reading × the walk-forward calibration spread{ok(b21) ? ` (b = ${fx(b21, 2)})` : ""},
+              i.e. how far it moves the displayed 1-month P(up) on the log-odds scale. ▲ pushes toward UP, ▼ toward DOWN; near 50 % a push
+              of 0.1 moves P(up) by about 2.5 points. Net of these ten: <b className={net >= 0 ? "up" : "down"}>{net >= 0 ? "▲ +" : "▼ "}{fx(net, 3)}</b>.
             </p>
           </>
         )}
@@ -519,7 +542,7 @@ function QualityPanel({ info, r, isAdmin, onTrain, trainErr, starting, infoErr }
 // ------------------------------------------------------------------ leaderboard
 type LbH = "1" | "5" | "21";
 
-function LeaderTable({ title, rows, sel, onPick }: { title: string; rows: QuantLeader[]; sel: string; onPick: (s: string) => void }) {
+function LeaderTable({ title, rows, sel, onPick, noEdge }: { title: string; rows: QuantLeader[]; sel: string; onPick: (s: string) => void; noEdge: boolean }) {
   const key = (e: KeyboardEvent<HTMLTableRowElement>, s: string) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(s); }
   };
@@ -535,9 +558,9 @@ function LeaderTable({ title, rows, sel, onPick }: { title: string; rows: QuantL
                 title={`Analyse ${x.symbol} · last close ${inr(x.close)}`}>
                 <td className="l muted">{i + 1}</td>
                 <td className="sym">{x.symbol}{x.sector && <small>{x.sector}</small>}</td>
-                <td className="l"><ProbBar p={x.p_up} label="" width={44} /></td>
+                <td className="l"><ProbBar p={x.p_up} label="" width={44} neutral={noEdge ? NO_LEAN : undefined} /></td>
                 <td><Ret v={x.exp_ret} d={2} /></td>
-                <td className="l"><SignalChip s={x.signal} /></td>
+                <td className="l"><SignalChip s={x.signal} noEdge={noEdge} /></td>
               </tr>
             ))}
           </tbody>
@@ -551,16 +574,29 @@ function LeaderboardPanel({ h, setH, board, sel, onPick }: { h: LbH; setH: (h: L
   const b = board.data;
   const metric = b?.model.metrics.find((m) => m.h === Number(h));
   const ex = extra(b);
-  const weak = edgeOf(metric?.auc, ex.edge ?? extra(metric).edge).none;
+  // flat: calibration gave every stock the same P(up) (the base rate), so the lists would only order noise
+  const ps = b ? [...b.up, ...b.down].map((x) => x.p_up).filter(ok) : [];
+  const flat = !!b && (!!b.flat || (ps.length > 1 && Math.max(...ps) - Math.min(...ps) < 1e-4));
+  const baseP = b && ok(b.base_p) ? b.base_p : ps.length ? ps[0] : null;
+  const weak = flat || edgeOf(metric?.auc, ex.edge ?? extra(metric).edge).none;
   return (
     <Panel code="RANK" title="Leaderboard" area="lead"
-      sub={b ? `every stock in the lake, ranked by P(up) · data to ${b.asof} · click a row to analyse it` : ""}
+      sub={b ? (flat ? `no ranking at this horizon · data to ${b.asof}` : `every stock in the lake, ranked by P(up) · data to ${b.asof} · click a row to analyse it`) : ""}
       actions={<Seg label="Leaderboard horizon" value={h} onChange={setH}
         options={(["1", "5", "21"] as LbH[]).map((k) => ({ v: k, label: hShort(Number(k)), title: `${k} trading day${k === "1" ? "" : "s"} ahead` }))} />}>
       {!b ? (board.loading ? <Empty>Scoring every stock with the current model…</Empty>
         : board.error ? <ErrorNote error={board.error} onRetry={board.reload} /> : <Empty>No leaderboard yet.</Empty>)
-        : b.model.status === "training" && !b.up.length ? <Training info={b.model} />
-          : (
+        : b.model.status === "training" && !b.up.length && !flat ? <Training info={b.model} />
+          : flat ? (
+            <div className={board.loading ? "qt-busy" : undefined}>
+              <p className="qt-note warn" role="note">
+                At this horizon the model gives every stock the same probability — the base rate{ok(baseP) ? ` (P(up) ${pctOf(baseP, 1)})` : ""} — because
+                walk-forward calibration flattened its scores to it, so there is no ranking.
+                {metric ? ` Walk-forward AUC ${fx(metric.auc, 3)}.` : ""}
+              </p>
+              {!!board.error && <ErrorNote error={board.error} onRetry={board.reload} />}
+            </div>
+          ) : (
             <div className={board.loading ? "qt-busy" : undefined}>
               <p className={`qt-note ${weak ? "warn" : ""}`}>
                 {metric ? <>At this horizon the model's walk-forward AUC is {fx(metric.auc, 3)}{weak && ex.edge_note ? ` (${ex.edge_note})` : ""}. </> : null}
@@ -569,8 +605,8 @@ function LeaderboardPanel({ h, setH, board, sel, onPick }: { h: LbH; setH: (h: L
                   : "A small edge on average across many stocks; any single name can still go the other way. Use it as a screen, not a buy list."}
               </p>
               <div className="qt-lead-grid">
-                <LeaderTable title="▲ Most likely up" rows={b.up} sel={sel} onPick={onPick} />
-                <LeaderTable title="▼ Most likely down" rows={b.down} sel={sel} onPick={onPick} />
+                <LeaderTable title="▲ Highest P(up)" rows={b.up} sel={sel} onPick={onPick} noEdge={weak} />
+                <LeaderTable title="▼ Lowest P(up)" rows={b.down} sel={sel} onPick={onPick} noEdge={weak} />
               </div>
               {!!board.error && <ErrorNote error={board.error} onRetry={board.reload} />}
             </div>

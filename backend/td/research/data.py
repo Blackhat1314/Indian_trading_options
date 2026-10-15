@@ -549,7 +549,12 @@ class ResearchData:
         market = _env_data(market_raw) or {}
         swing = _env_data(swing_raw) or {}
         rows = [{k: v for k, v in r.items() if k != "stats"} for r in swing.get("rows") or [] if isinstance(r, dict)]
-        out: dict = {"live": bool(status),
+        try:
+            st = bus.loads(status) if status else {}
+        except ValueError:
+            st = {}
+        # live = the analytics worker is up and has seen ticks this session (a tick-less snapshot is not "today")
+        out: dict = {"live": isinstance(st, dict) and bool(st.get("ticks")),
                      "clock": {k: clock.get(k) for k in ("ts", "phase", "date", "time", "source")} if clock else {},
                      "market": {}, "sector": {}, "swing": {}}
         if market:

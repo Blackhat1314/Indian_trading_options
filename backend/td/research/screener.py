@@ -627,11 +627,26 @@ def _metrics(f: dict) -> tuple[dict[str, dict], dict[str, Any]]:
         add("earnings_yield", "Earnings yield", eps_ttm / price * 100, "%", "TTM EPS ÷ price")
     else:
         add("earnings_yield", "Earnings yield", None, "%", "no P/E or TTM EPS")
-    p3 = out["profit_cagr_3y"]["value"]
-    if pe is not None and pe > 0 and p3 is not None and p3 > 0:
-        add("peg", "PEG", pe / p3, "x", f"P/E {pe:g} ÷ 3y profit CAGR {p3:.1f} %")
+    # P/E is per share, so PEG divides it by per-share growth: total net profit grows with the share count (a
+    # merger or new shares) while EPS does not. Net profit growth stands in only when there is no EPS CAGR.
+    p3, e3 = out["profit_cagr_3y"]["value"], out["eps_cagr_3y"]["value"]
+    if e3 is not None or p3 is None:
+        basis, g, why = "3y EPS CAGR", e3, ""
+        if e3 is not None and p3 is not None and abs(p3 - e3) > 5:
+            why = (f"; 3y net profit CAGR {p3:.1f} % differs by more than 5 pp, usually a change in share count "
+                   "(merger, new shares or buyback)")
     else:
-        add("peg", "PEG", None, "x", "needs a positive P/E and positive 3y profit CAGR")
+        basis, g = "3y net profit CAGR", p3
+        why = f"; no 3y EPS CAGR ({out['eps_cagr_3y']['note']}), so net profit growth stands in"
+    facts["peg_growth"] = (basis, g)
+    if pe is None or pe <= 0:
+        add("peg", "PEG", None, "x", "needs a positive P/E")
+    elif g is None:
+        add("peg", "PEG", None, "x", f"needs a 3y EPS or net profit CAGR ({out['eps_cagr_3y']['note']})")
+    elif g <= 0:
+        add("peg", "PEG", None, "x", f"{basis} {g:.1f} % is not positive{why}")
+    else:
+        add("peg", "PEG", pe / g, "x", f"P/E {pe:g} ÷ {basis} {g:.1f} %{why}")
     if price and book and book > 0:
         add("price_to_book", "Price / book", price / book, "x", f"price ₹{price:,.2f} ÷ book value ₹{book:,.2f}")
     else:
@@ -743,12 +758,14 @@ def scorecard(f: dict) -> dict:
                            "value": _fmt(v(key), "%") if v(key) is not None
                            else f"₹ {cur:,.0f} Cr vs ₹ {prev:,.0f} Cr"})
 
-    pe, p3 = facts.get("pe"), v("profit_cagr_3y")
-    if pe is not None and pe > 0 and p3 is not None and p3 <= 0:
-        peg_check = {"label": "Growth justifies the P/E", "pass": False, "rule": "PEG (P/E ÷ 3y profit CAGR) < 1.5",
-                     "value": f"P/E {pe:g} with 3y profit CAGR {p3:.1f} %"}
+    pe, (basis, g) = facts.get("pe"), facts["peg_growth"]
+    peg_rule = (f"PEG (P/E ÷ {basis}) < 1.5" if basis == "3y EPS CAGR"
+                else f"PEG (P/E ÷ {basis}; EPS CAGR unavailable) < 1.5")
+    if pe is not None and pe > 0 and g is not None and g <= 0:
+        peg_check = {"label": "Growth justifies the P/E", "pass": False, "rule": peg_rule,
+                     "value": f"P/E {pe:g} with {basis} {g:.1f} %"}
     else:
-        peg_check = check("Growth justifies the P/E", "PEG (P/E ÷ 3y profit CAGR) < 1.5", "peg", lambda x: x < 1.5)
+        peg_check = check("Growth justifies the P/E", peg_rule, "peg", lambda x: x < 1.5)
     med = facts.get("peer_median_pe")
     valuation = [
         check("P/E below sector median", "P/E < median P/E of Screener peers", "pe_vs_peers", lambda x: x < 1,
@@ -820,15 +837,32 @@ def finalize(f: dict) -> dict:
 
 # ------------------------------------------------------------------ client
 class ScreenerError(RuntimeError):
-    """Screener.in could not be reached or returned an unusable page, and no cached copy exists."""
+    """Screener.in could not be reached or returned an unusable page, and no cached copy exists.
+    busy=True: not attempted because the gateway's fetch queue was full (the router maps it by name, so it stays
+    this class rather than a subclass)."""
+
+    def __init__(self, message: str, *, busy: bool = False):
+        super().__init__(message)
+        self.busy = busy
+
+
+class _NotOnScreener(KeyError):
+    """Screener.in answered 404 for this symbol (remembered for missing_ttl so repeats cost no request)."""
 
 
 class ScreenerClient:
-    """Fetches, parses and caches Screener.in company pages, one polite request at a time."""
+    """Fetches, parses and caches Screener.in company pages, one polite request at a time.
+
+    At most `max_queued` company fetches wait for the shared request slot; more are turned away at once with
+    ScreenerError(busy) instead of queueing without bound. A 404 is remembered for `missing_ttl` seconds (also
+    across refresh=True), so an unknown symbol costs Screener.in one request a day, not one per call."""
+
+    MISSING_MAX = 4096                              # remembered 404s; the oldest are forgotten beyond this
 
     def __init__(self, cache_dir: Path | str | None = None, ttl_hours: float | None = None,
                  min_interval: float | None = None, transport: httpx.AsyncBaseTransport | None = None,
-                 retry_pause: float = 5.0, min_refresh_age: float = 600.0, timeout: float = 20.0):
+                 retry_pause: float = 5.0, min_refresh_age: float = 600.0, timeout: float = 20.0,
+                 max_queued: int = 10, missing_ttl: float = 24 * 3600.0):
         self.cache_dir = Path(cache_dir) if cache_dir else Path(settings.data_dir) / "cache" / "screener"
         self.ttl = (settings.screener_ttl_hours if ttl_hours is None else ttl_hours) * 3600
         self.min_interval = settings.screener_min_interval if min_interval is None else min_interval
@@ -836,9 +870,13 @@ class ScreenerClient:
         self.min_refresh_age = min_refresh_age      # a refresh younger than this is served from cache
         self.timeout = timeout
         self._transport = transport
+        self.max_queued = max_queued
+        self.missing_ttl = missing_ttl
         self._lock = asyncio.Lock()                 # one request in flight, spaced by min_interval
         self._last = -math.inf                      # monotonic time the last request finished
-        self._sym_locks: dict[str, asyncio.Lock] = {}
+        self._sym_locks: dict[str, list] = {}       # "SYM:view" → [lock, callers holding or awaiting it]
+        self._queued = 0                            # company fetches admitted and not yet finished
+        self._missing: dict[str, float] = {}        # "SYM:view" → monotonic time its remembered 404 expires
         self._loop: asyncio.AbstractEventLoop | None = None
         self.requests = 0
 
@@ -851,29 +889,76 @@ class ScreenerClient:
             raise ValueError(f"view must be one of {', '.join(VIEWS)}")
         loop = asyncio.get_running_loop()
         if loop is not self._loop:                   # asyncio locks belong to one event loop
-            self._loop, self._lock, self._sym_locks = loop, asyncio.Lock(), {}
-        lock = self._sym_locks.setdefault(f"{sym}:{view}", asyncio.Lock())
-        async with lock:                             # concurrent callers for one symbol share a single fetch
-            cached = self._read_cache(sym, view)
-            age = time.time() - cached["fetched_at"] if cached else math.inf
-            if cached and age < self.ttl and (not refresh or age < self.min_refresh_age):
-                note = (f"Fetched from Screener.in {age / 60:.0f} min ago; refresh is limited to once per "
-                        f"{self.min_refresh_age / 60:.0f} min." if refresh else None)
-                return self._served(cached, stale=False, note=note)
-            try:
-                f = await self._fetch(sym, view)
-            except ScreenerError as e:
-                if cached is None:
+            self._loop, self._lock, self._sym_locks, self._queued = loop, asyncio.Lock(), {}, 0
+        key = f"{sym}:{view}"
+        self._check_missing(key, sym)                # a remembered 404 never touches the locks or the network
+        slot = self._sym_locks.setdefault(key, [asyncio.Lock(), 0])
+        slot[1] += 1
+        try:
+            async with slot[0]:                      # concurrent callers for one symbol share a single fetch
+                self._check_missing(key, sym)
+                cached = self._read_cache(sym, view)
+                age = time.time() - cached["fetched_at"] if cached else math.inf
+                if cached and age < self.ttl and (not refresh or age < self.min_refresh_age):
+                    note = (f"Fetched from Screener.in {age / 60:.0f} min ago; refresh is limited to once per "
+                            f"{self.min_refresh_age / 60:.0f} min." if refresh else None)
+                    return self._served(cached, stale=False, note=note)
+                try:
+                    f = await self._queued_fetch(sym, view)
+                except _NotOnScreener:
+                    self._remember_missing(key)
                     raise
-                log.warning("screener %s: %s — serving the cached copy", sym, e)
-                when = time.strftime("%d %b %Y %H:%M", time.localtime(cached["fetched_at"]))
-                return self._served(cached, stale=age >= self.ttl,
-                                    note=f"Screener.in unavailable ({e}); showing the copy fetched {when}.")
-            self._write_cache(sym, view, f)
-            return f
+                except ScreenerError as e:
+                    if cached is None:
+                        raise
+                    when = time.strftime("%d %b %Y %H:%M", time.localtime(cached["fetched_at"]))
+                    if e.busy:
+                        log.info("screener %s: %s — serving the cached copy", sym, e)
+                        note = (f"Not refetched: the gateway's Screener.in queue is full; showing the copy "
+                                f"fetched {when}.")
+                    else:
+                        log.warning("screener %s: %s — serving the cached copy", sym, e)
+                        note = f"Screener.in unavailable ({e}); showing the copy fetched {when}."
+                    return self._served(cached, stale=age >= self.ttl, note=note)
+                self._write_cache(sym, view, f)
+                return f
+        finally:
+            slot[1] -= 1
+            if not slot[1] and self._sym_locks.get(key) is slot:
+                del self._sym_locks[key]             # one entry per symbol in use, not per symbol ever asked
 
     async def aclose(self) -> None:
         """Nothing to release: each request uses its own short-lived HTTP client (they are ≥ seconds apart)."""
+
+    # ---- admission: remembered 404s and the bounded queue
+    def _check_missing(self, key: str, sym: str) -> None:
+        expires = self._missing.get(key)
+        if expires is None:
+            return
+        if expires > time.monotonic():
+            raise _NotOnScreener(f"{sym} is not on Screener.in")
+        del self._missing[key]
+
+    def _remember_missing(self, key: str) -> None:
+        now = time.monotonic()
+        self._missing.pop(key, None)
+        if len(self._missing) >= self.MISSING_MAX:
+            self._missing = {k: t for k, t in self._missing.items() if t > now}
+            while len(self._missing) >= self.MISSING_MAX:
+                del self._missing[next(iter(self._missing))]          # oldest first (insertion order)
+        self._missing[key] = now + self.missing_ttl
+
+    async def _queued_fetch(self, sym: str, view: str) -> dict:
+        """_fetch, unless max_queued company fetches are already admitted: then fail at once. Admission is per
+        company (2–3 requests), so an admitted fetch is never cut off between its page and peers requests."""
+        if self._queued >= self.max_queued:
+            raise ScreenerError(f"busy — {self._queued} company pages are already queued; try again shortly",
+                                busy=True)
+        self._queued += 1
+        try:
+            return await self._fetch(sym, view)
+        finally:
+            self._queued = max(0, self._queued - 1)      # 0 after a reset for a new event loop
 
     # ---- fetching
     async def _get(self, path: str) -> httpx.Response:
@@ -909,7 +994,7 @@ class ScreenerClient:
         path = f"/company/{quote(sym, safe='')}/" + ("consolidated/" if view == "consolidated" else "")
         resp = await self._get(path)
         if resp.status_code == 404:
-            raise KeyError(f"{sym} is not on Screener.in")
+            raise _NotOnScreener(f"{sym} is not on Screener.in")
         if resp.status_code != 200:
             raise ScreenerError(f"HTTP {resp.status_code}")
         parsed = await asyncio.to_thread(_parse_html, resp.text, sym, str(resp.url), view)
@@ -985,4 +1070,9 @@ class ScreenerClient:
         f = dict(cached)
         f["cached"], f["stale"] = True, stale
         f["warnings"] = ([note] if note else []) + list(cached.get("warnings") or [])
+        try:
+            finalize(f)                    # metrics and checks follow the current rules, not the ones at fetch time
+        except Exception:                  # a copy this code can no longer read keeps what it was saved with
+            log.exception("screener %s: recomputing the cached metrics failed", cached.get("symbol"))
+            f["derived"], f["scorecard"] = cached.get("derived") or [], cached.get("scorecard") or {}
         return f

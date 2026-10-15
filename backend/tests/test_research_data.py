@@ -547,7 +547,9 @@ def test_market_context(env):
         await bus.publish_snapshot(r, "swing", {"ts": 1, "rules": {"target": 6}, "stats": {},
                                                 "rows": [{"symbol": "RELIANCE", "setup": "BREAKOUT", "trend": 3,
                                                           "stats": {"n": 5}}]})
-        await r.set(bus.k_status("analytics"), b"{}", ex=30)
+        await r.set(bus.k_status("analytics"), bus.dumps({"ticks": 0}), ex=30)
+        assert not (await rd.market_context("RELIANCE"))["live"]      # worker up, but no ticks this session yet
+        await r.set(bus.k_status("analytics"), bus.dumps({"ticks": 5120}), ex=30)
         ctx = await rd.market_context("RELIANCE")
         assert ctx["live"] and ctx["clock"]["phase"] == "OPEN" and ctx["clock"]["date"] == "2026-10-15"
         assert ctx["market"]["indices"][0]["name"] == "NIFTY" and ctx["market"]["breadth"]["adv"] == 120

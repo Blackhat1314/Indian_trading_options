@@ -107,6 +107,7 @@ export interface QuantHorizon {
   oos_auc: number | null; oos_acc: number | null; base_rate: number | null;   // walk-forward, whole universe
   edge: boolean;                 // the walk-forward verdict (AUC ≥ 0.52, 2 s.e. above 0.5, every fold ≥ 0.5, calibrated spread)
   edge_note: string | null;      // why there is no / only a weak edge
+  flat: boolean;                 // calibration flattened this horizon: p_up = the base rate for every stock, exp_ret 0, median = spot
 }
 
 export interface QuantComponent {
@@ -117,7 +118,7 @@ export interface QuantComponent {
   tone: "up" | "down" | "neutral";
 }
 
-export interface QuantContribution { feature: string; label: string; value: number; contribution: number }   // log-odds, 1-month model
+export interface QuantContribution { feature: string; label: string; value: number; contribution: number }   // calibrated log-odds (b·coef·z), 1-month model
 
 export interface QuantMetric {
   h: number; auc: number; acc: number; brier: number; brier_base: number;
@@ -140,7 +141,13 @@ export interface QuantResult {
   horizons: QuantHorizon[];
   components: QuantComponent[];
   contributions: QuantContribution[];
-  regime: { state: "bull" | "bear" | "sideways"; labels: string[]; probs: number[]; mu_annual: number[]; vol_annual: number[]; expected_duration: number[] } | null;
+  contributions_flat: boolean;   // the 1-month P(up) is flattened to the base rate, so it depends on no input (contributions = [])
+  regime: {
+    state: "bull" | "bear" | "sideways"; labels: string[]; probs: number[]; mu_annual: number[]; vol_annual: number[]; expected_duration: number[];
+    // displayed regime = the Monte Carlo desk's HMM fit on the latest window (dates of its first / last bar, years)
+    fit_start: string; fit_end: string; fit_years: number;
+    model_fit_end: string | null;   // end of the fixed HMM fit behind the model's own (causal) regime feature
+  } | null;
   vol: { garch_now: number; garch_21d: number; long_run: number; ewma: number; realized_21: number; percentile: number } | null;   // annualised; percentile 0…1
   chart: {
     ts: number[]; close: number[]; trend: number[]; upper: number[]; lower: number[]; bull_prob: number[];   // last ~1 year;
@@ -153,7 +160,13 @@ export interface QuantResult {
 }
 
 export interface QuantLeader { symbol: string; sector: string; close: number; p_up: number; exp_ret: number; signal: Signal }
-export interface QuantLeaderboard { h: number; asof: string; up: QuantLeader[]; down: QuantLeader[]; model: QuantModelInfo; edge: boolean; edge_note: string | null }
+export interface QuantLeaderboard {
+  h: number; asof: string;
+  up: QuantLeader[]; down: QuantLeader[];   // highest / lowest P(up); both empty when `flat`
+  model: QuantModelInfo; edge: boolean; edge_note: string | null;
+  flat: boolean;                 // every stock gets the same P(up) (the base rate) at this horizon: no ranking
+  base_p: number | null;         // that base rate (the model's training up-share at this horizon)
+}
 
 // ------------------------------------------------------------------ Screener fundamentals
 // Screener numbers keep Screener's units: percentages in percent (12.5 = 12.5 %), money in ₹ crore.

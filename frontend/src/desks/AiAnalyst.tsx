@@ -79,20 +79,36 @@ const STANCE: Record<Stance, { glyph: string; text: string; tone: "up" | "down" 
 const stanceOf = (s: unknown) => (typeof s === "string" && Object.hasOwn(STANCE, s) ? STANCE[s as Stance] : STANCE.neutral);
 const confOf = (c: unknown): Conf => (c === "high" || c === "medium" ? c : "low");
 
-function StanceBadge({ stance, big }: { stance: unknown; big?: boolean }) {
+/* A rule-based view (no model ran, or the model left a horizon out and the server filled it with the rules) reads
+ * differently from a model's: its stance is a lean from trend, quant edge and the Screener grade that never moves
+ * the targets, its range is the simulation's 25th–75th percentile and its base target IS the simulated median. The
+ * labels and tooltips below say which of the two is on screen. */
+const TIP = {
+  stance: { ai: "Expected return compared with the CAPM-implied return in the dossier",
+    rules: "Rule-based lean (trend, quant edge, Screener grade) — not applied to the targets" },
+  conf: { ai: "High only when independent kinds of evidence agree and the data is complete",
+    rules: "Rule-based: medium only when at least three inputs agree on a clear lean, otherwise low" },
+  range: { ai: "The range the analysis considers likely (roughly the central two thirds)",
+    rules: "25th–75th percentile of the simulation (the central half), whatever the stance" },
+  mc: { ai: "Is the base target inside the Monte Carlo 5–95% band?",
+    rules: "The rule-based base target is the Monte Carlo median by construction, so there is nothing to check" },
+};
+const tipOf = (t: { ai: string; rules: string }, rule: boolean) => (rule ? t.rules : t.ai);
+
+function StanceBadge({ stance, big, rule }: { stance: unknown; big?: boolean; rule: boolean }) {
   const s = stanceOf(stance);
   return (
-    <span className={`ai-stance ${s.tone}${big ? " big" : ""}`} title="Expected return compared with the CAPM-implied return in the dossier">
+    <span className={`ai-stance ${s.tone}${big ? " big" : ""}`} title={tipOf(TIP.stance, rule)}>
       <span aria-hidden="true">{s.glyph}</span>{s.text}
     </span>
   );
 }
 
-function ConfMeter({ c }: { c: unknown }) {
+function ConfMeter({ c, rule }: { c: unknown; rule: boolean }) {
   const conf = confOf(c);
   const n = conf === "high" ? 3 : conf === "medium" ? 2 : 1;
   return (
-    <span className="ai-conf" title="High only when independent kinds of evidence agree and the data is complete">
+    <span className="ai-conf" title={tipOf(TIP.conf, rule)}>
       <span className="ai-pips" aria-hidden="true">{[0, 1, 2].map((i) => <i key={i} className={i < n ? "on" : ""} />)}</span>
       {conf} confidence
     </span>
@@ -121,16 +137,25 @@ function reportSpot(rep: AiReport): number | null {
 interface HPoint {
   key: HKey; name: string; ts: number;           // ts ≈ the analysis date + the horizon in calendar months
   view: AiHorizonView | null;
+  rule: boolean;                                 // rule-based view (see TIP): base = the simulated median
   bear: AiScenario | null; base: AiScenario | null; bull: AiScenario | null;
 }
+
+/** The whole report without a model, or one horizon the model left out: the server's rule-based rationale starts
+ *  "Rule-based". */
+const ruleBased = (rep: AiReport, v: AiHorizonView | null) =>
+  !rep.ai || (typeof v?.rationale === "string" && v.rationale.startsWith("Rule-based"));
 
 function horizonPoints(rep: AiReport, asofTs: number): HPoint[] {
   return HORIZONS.map((h) => {
     const view = (rep.horizons ?? []).find((v) => v?.horizon === h.key) ?? null;
     const sc = (name: AiScenario["name"]) => view?.scenarios?.find((s) => s?.name === name && ok(s.target_price) && s.target_price > 0) ?? null;
-    return { key: h.key, name: h.name, ts: addMonths(asofTs, h.months), view, bear: sc("bear"), base: sc("base"), bull: sc("bull") };
+    return { key: h.key, name: h.name, ts: addMonths(asofTs, h.months), view, rule: ruleBased(rep, view), bear: sc("bear"), base: sc("base"), bull: sc("bull") };
   });
 }
+
+/** Base target vs the Monte Carlo band, as short text: a rule-based base IS the median, so it is not "inside". */
+const mcText = (p: HPoint, c: NonNullable<AiHorizonView["mc_check"]>) => (p.rule ? "= median" : c.base_in_band ? "✓ inside" : "⚠ outside");
 
 // ------------------------------------------------------------------ state (results survive desk switches)
 interface Shown { sym: string; rep: AiReport; cached: boolean; via: "job" | "saved"; steps: AiStep[] | null }
@@ -432,7 +457,7 @@ function ScoreBars({ score }: { score: AiReport["score"] | null | undefined }) {
 }
 
 /** The four horizons in one table, so the first screen carries every target. */
-function Glance({ points }: { points: HPoint[] }) {
+function Glance({ points, rule }: { points: HPoint[]; rule: boolean }) {
   if (!points.some((p) => p.view)) return null;
   return (
     <div className="ai-glance-wrap">
@@ -440,9 +465,9 @@ function Glance({ points }: { points: HPoint[] }) {
         <caption className="sr-only">Views by horizon at a glance</caption>
         <thead>
           <tr>
-            <th className="l" scope="col">Horizon</th><th className="l" scope="col">Stance</th>
-            <th scope="col">Base target</th><th scope="col" title="The range the analysis considers likely (roughly the central two thirds)">Likely return</th>
-            <th className="l" scope="col" title="Is the base target inside the Monte Carlo 5–95% band?">MC check</th>
+            <th className="l" scope="col">Horizon</th><th className="l" scope="col" title={tipOf(TIP.stance, rule)}>{rule ? "Lean" : "Stance"}</th>
+            <th scope="col">Base target</th><th scope="col" title={tipOf(TIP.range, rule)}>{rule ? "25th–75th pct" : "Likely return"}</th>
+            <th className="l" scope="col" title={tipOf(TIP.mc, rule)}>MC check</th>
           </tr>
         </thead>
         <tbody>
@@ -452,10 +477,10 @@ function Glance({ points }: { points: HPoint[] }) {
             return (
               <tr key={p.key}>
                 <td className="l"><b>{p.key}</b> <small className="muted">≈ {monthYear(p.ts)}</small></td>
-                <td className="l">{v ? <><StanceBadge stance={v.stance} /> <small className="muted">{confOf(v.confidence)}</small></> : <span className="muted">no view</span>}</td>
+                <td className="l">{v ? <><StanceBadge stance={v.stance} rule={p.rule} /> <small className="muted">{confOf(v.confidence)}</small></> : <span className="muted">no view</span>}</td>
                 <td>{p.base ? <>{rs(p.base.target_price)} <Chg v={p.base.return_pct} d={1} /></> : "—"}</td>
-                <td>{v ? <><Chg v={v.expected_return_low_pct} d={1} /> <span className="muted">…</span> <Chg v={v.expected_return_high_pct} d={1} /></> : "—"}</td>
-                <td className="l">{c ? (c.base_in_band ? <span title={c.note}>✓ inside</span> : <span className="warn" title={c.note}>⚠ outside</span>) : <span className="muted">—</span>}</td>
+                <td title={v ? tipOf(TIP.range, p.rule) : undefined}>{v ? <><Chg v={v.expected_return_low_pct} d={1} /> <span className="muted">…</span> <Chg v={v.expected_return_high_pct} d={1} /></> : "—"}</td>
+                <td className="l">{c ? <span className={p.rule ? "muted" : c.base_in_band ? undefined : "warn"} title={c.note}>{mcText(p, c)}</span> : <span className="muted">—</span>}</td>
               </tr>
             );
           })}
@@ -473,12 +498,12 @@ function Verdict({ shown, spot, nowSpot, source, points }: { shown: Shown; spot:
   return (
     <Panel code="AI" title="Verdict" area="view" className="ai-report ai-verdict" sub={rep.name && rep.name !== rep.symbol ? `${rep.symbol} · ${rep.name}` : rep.symbol}>
       <div className="ai-vhead">
-        <StanceBadge stance={rep.overall_stance} big />
-        <ConfMeter c={rep.overall_confidence} />
+        <StanceBadge stance={rep.overall_stance} big rule={!rep.ai} />
+        <ConfMeter c={rep.overall_confidence} rule={!rep.ai} />
         <span className="ai-tags">
           {rep.ai
             ? <span className="chip violet" title="Written by an AI model from the dossier below">AI</span>
-            : <span className="chip amber" title="No AI model ran: fixed rules over the same dossier (trend, quant signal with measured edge, Screener grade, Monte Carlo median)">RULE-BASED</span>}
+            : <span className="chip amber" title="No AI model ran: fixed rules over the same dossier. The stance leans on trend, the quant signal (only with measured edge) and the Screener grade; the targets are the Monte Carlo percentiles, untouched by the stance">RULE-BASED</span>}
           {shown.cached && <span className="chip cyan" title="Today's earlier analysis was returned — no new model call">CACHED</span>}
           {!today && <span className="chip" title="A saved report from an earlier day — ANALYSE for today's view">SAVED {dateIST(rep.generated_at)}</span>}
           {source === "sim" && <span className="chip violet" title="DATA_SOURCE=sim: the price history is synthetic, so technical and statistical conclusions are illustrative only">SIM DATA</span>}
@@ -493,7 +518,7 @@ function Verdict({ shown, spot, nowSpot, source, points }: { shown: Shown; spot:
       </div>
       <p className="ai-summary">{rep.summary?.trim() || "The report has no summary."}</p>
       <div className="ai-pad"><Warnings items={rep.warnings} label="Report warnings" /></div>
-      <Glance points={points} />
+      <Glance points={points} rule={!rep.ai} />
       <ScoreBars score={rep.score} />
     </Panel>
   );
@@ -568,7 +593,7 @@ function buildModel(history: [number, number][], asofTs: number, spot: number | 
     const c = p.view?.mc_check;
     return `${p.key} (about ${monthYear(p.ts)}): base ${rs(p.base!.target_price)} (${pct(p.base!.return_pct, 1, false)})` +
       (p.bear && p.bull ? `, bear ${rs(p.bear.target_price)} to bull ${rs(p.bull.target_price)}` : "") +
-      (c ? `, Monte Carlo 5–95% ${rs(c.p5)} to ${rs(c.p95)}, base ${c.base_in_band ? "inside" : "outside"} the band` : "");
+      (c ? `, Monte Carlo 5–95% ${rs(c.p5)} to ${rs(c.p95)}, ${p.rule ? "base is the median by construction" : `base ${c.base_in_band ? "inside" : "outside"} the band`}` : "");
   }).join("; ") + "." : "No horizon targets.");
   return { hist, pts, asofTs, spot, x0, x1, ext, recent: Date.now() / 1000 - asofTs < 5 * DAY, summary };
 }
@@ -694,14 +719,14 @@ function HorizonPlot({ m, w, h }: { m: HModel; w: number; h: number }) {
     tip = {
       x, title: `${p.key} · ≈ ${monthYear(p.ts)}`,
       rows: [
-        { value: `${s.glyph} ${s.text}`, label: `${confOf(p.view?.confidence)} confidence` },
+        { value: `${s.glyph} ${s.text}`, label: `${confOf(p.view?.confidence)} confidence${p.rule ? " · rule-based lean" : ""}` },
         { value: scenText(p.bull), label: `bull · ${probText(p.bull?.probability)}`, kind: "line", color: "var(--viz-2)" },
         { value: scenText(p.base), label: `base · ${probText(p.base?.probability)}`, kind: "dot", color: "var(--viz-2)" },
         { value: scenText(p.bear), label: `bear · ${probText(p.bear?.probability)}`, kind: "line", color: "var(--viz-2)" },
         ...(c ? [
           { value: `${rs(c.p5)} – ${rs(c.p95)}`, label: "Monte Carlo 5–95%", kind: "area" as const, color: "var(--viz-1)", opacity: 0.5 },
           { value: rs(c.p50), label: "Monte Carlo median", kind: "line" as const, color: "var(--viz-1)" },
-          { value: c.base_in_band ? "✓ inside" : "⚠ outside", label: "base vs the 5–95% band" },
+          { value: mcText(p, c), label: p.rule ? "base = the median by construction" : "base vs the 5–95% band" },
         ] : [{ value: "—", label: "no Monte Carlo check" }]),
       ],
     };
@@ -857,7 +882,7 @@ function HorizonChart({ history, asofTs, spot, points, symbol, asof, busy }: {
                     <td>{scenText(p.bull)} · {probText(p.bull?.probability)}</td>
                     <td>{c ? `${rs(c.p5)} – ${rs(c.p95)}` : "—"}</td>
                     <td>{c ? rs(c.p50) : "—"}</td>
-                    <td className="l">{c ? (c.base_in_band ? "✓ inside" : "⚠ outside") : "—"}</td>
+                    <td className="l" title={c?.note}>{c ? mcText(p, c) : "—"}</td>
                   </tr>
                 );
               })}
@@ -909,13 +934,14 @@ function RangeStrip({ p, spot }: { p: HPoint; spot: number | null }) {
 function McCheck({ p, spot }: { p: HPoint; spot: number | null }) {
   const c = p.view?.mc_check ?? null;
   return (
-    <div className={`ai-mc ${c ? (c.base_in_band ? "in" : "out") : "na"}`}>
+    <div className={`ai-mc ${c ? (p.rule ? "na" : c.base_in_band ? "in" : "out") : "na"}`}>
       <h4 className="ai-h">Monte Carlo check</h4>
       <RangeStrip p={p} spot={spot} />
       {c ? (
         <>
           <div className="ai-mc-verdict">
-            {c.base_in_band ? <><span aria-hidden="true">✓ </span>Base target inside the 5–95% band</> : <b><span aria-hidden="true">⚠ </span>Base target outside the 5–95% band</b>}
+            {p.rule ? <><span aria-hidden="true">= </span>Base target is the simulated median by construction — not an independent check</>
+              : c.base_in_band ? <><span aria-hidden="true">✓ </span>Base target inside the 5–95% band</> : <b><span aria-hidden="true">⚠ </span>Base target outside the 5–95% band</b>}
             {!c.note && <> ({rs(c.p5)} – {rs(c.p95)}, median {rs(c.p50)})</>}
           </div>
           {c.note && <p className="ai-mc-note">{c.note}</p>}
@@ -948,11 +974,11 @@ function HorizonCard({ p, spot }: { p: HPoint; spot: number | null }) {
       ) : (
         <>
           <div className="ai-hrow">
-            <StanceBadge stance={v.stance} />
-            <ConfMeter c={v.confidence} />
+            <StanceBadge stance={v.stance} rule={p.rule} />
+            <ConfMeter c={v.confidence} rule={p.rule} />
           </div>
-          <div className="ai-range" title="The outcome range the analysis considers likely (roughly the central two thirds)">
-            Likely return <Chg v={v.expected_return_low_pct} d={1} /> <span className="muted">to</span> <Chg v={v.expected_return_high_pct} d={1} />
+          <div className="ai-range" title={tipOf(TIP.range, p.rule)}>
+            {p.rule ? "Simulated 25th–75th percentile" : "Likely return"} <Chg v={v.expected_return_low_pct} d={1} /> <span className="muted">to</span> <Chg v={v.expected_return_high_pct} d={1} />
           </div>
           <div>
             <h4 className="ai-h">Scenarios</h4>

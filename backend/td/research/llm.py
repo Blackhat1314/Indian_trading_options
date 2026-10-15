@@ -252,6 +252,7 @@ class LLMClient:
 
     async def _anthropic_call(self, system: str, user: str, schema: dict) -> _Raw:
         import anthropic
+        import httpx2  # the SDK's own HTTP library (installed with anthropic)
         client = self._anthropic_client()
         output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
         effort = (self.cfg.ai_effort or "").strip().lower()
@@ -289,6 +290,14 @@ class LLMClient:
             raise LLMError("could not reach the Anthropic API (network error)", "network") from e
         except anthropic.AnthropicError as e:
             raise LLMError(f"Anthropic client error: {str(e)[:300]}", "status") from e
+        except httpx2.TimeoutException as e:
+            # the SDK wraps errors while opening the stream (above) but re-raises its HTTP library's own errors once
+            # the answer is streaming; tokens may already be billed, hence "truncated"
+            raise LLMError(f"the model stopped answering within AI_TIMEOUT={self.cfg.ai_timeout:g}s (mid-answer)",
+                           "truncated") from e
+        except httpx2.HTTPError as e:
+            raise LLMError(f"the connection to the Anthropic API dropped mid-answer ({type(e).__name__})",
+                           "truncated") from e
 
         usage = None
         if getattr(msg, "usage", None) is not None:

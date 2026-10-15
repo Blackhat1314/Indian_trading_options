@@ -316,7 +316,7 @@ def test_derived_metrics_exact():
         "promoter_change_4q": 54.2 - 55.0,
         "fii_dii_change_4q": (16.5 + 11.0) - (15.0 + 10.0),
         "earnings_yield": 100 / 59.9,
-        "peg": 59.9 / round(((200 / 124) ** (1 / 3) - 1) * 100, 2),
+        "peg": 59.9 / round(((20 / 12.4) ** (1 / 3) - 1) * 100, 2),        # per-share (EPS) growth
         "price_to_book": 1234 / 105,
     }
     for key, want in expect.items():
@@ -445,6 +445,58 @@ def test_scorecard_loss_maker_and_debt_free():
     assert metric(f, "earnings_yield")["note"] == "TTM EPS ÷ price"
 
 
+def _with_pe_and_eps(pe: float, eps: list | None) -> dict:
+    """The fixture with another Stock P/E and EPS row (None drops the row). Its net profit grows 124 → 200 over
+    Mar 2023 → Mar 2026, a 3y CAGR of 17.3 %."""
+    f = parsed()
+    for r in f["ratios"]:
+        if r["key"] == "stock_pe":
+            r["value"] = pe
+    pl = f["profit_loss"]
+    if eps is None:
+        pl["rows"] = [r for r in pl["rows"] if r["label"] != "EPS in Rs"]
+    else:
+        next(r for r in pl["rows"] if r["label"] == "EPS in Rs")["values"] = eps
+    return sc.finalize(f)
+
+
+def test_peg_uses_per_share_growth():
+    profit3 = ((200 / 124) ** (1 / 3) - 1) * 100
+    # EPS grew with profit: PEG = 14.2 ÷ 17.3 % passes, and the rule names the growth it used
+    f = _with_pe_and_eps(14.2, [5.0, 7.5, 12.4, 14.9, 17.3, 20.0, 20.5])
+    peg, c = metric(f, "peg"), checks(f)["Growth justifies the P/E"]
+    assert peg["value"] == pytest.approx(14.2 / round(profit3, 2), abs=0.006)
+    assert peg["note"] == f"P/E 14.2 ÷ 3y EPS CAGR {profit3:.1f} %"
+    assert c["pass"] is True and c["rule"] == "PEG (P/E ÷ 3y EPS CAGR) < 1.5"
+
+    # a merger issued many new shares: net profit CAGR 17.3 % but EPS CAGR 5 % → PEG 2.85 fails (was 0.82)
+    eps3 = 12.4 * 1.05 ** 3
+    f = _with_pe_and_eps(14.2, [5.0, 7.5, 12.4, 12.9, 13.6, round(eps3, 2), 14.5])
+    peg, c = metric(f, "peg"), checks(f)["Growth justifies the P/E"]
+    e3 = metric(f, "eps_cagr_3y")["value"]
+    assert e3 == pytest.approx(5.0, abs=0.01)
+    assert peg["value"] == pytest.approx(14.2 / e3, abs=0.006)
+    assert "3y EPS CAGR 5.0 %" in peg["note"] and "net profit CAGR 17.3 % differs" in peg["note"]
+    assert c["pass"] is False and c["value"] == "2.85×" and "EPS" in c["rule"]
+
+    # EPS shrank while net profit grew: no PEG, and the check fails on per-share growth (not a profit-based pass)
+    f = _with_pe_and_eps(14.2, [5.0, 7.5, 12.4, 12.0, 11.5, 11.0, 11.0])
+    peg, c = metric(f, "peg"), checks(f)["Growth justifies the P/E"]
+    assert peg["value"] is None and peg["note"].startswith("3y EPS CAGR -3.9 % is not positive")
+    assert c["pass"] is False and c["value"] == "P/E 14.2 with 3y EPS CAGR -3.9 %"
+
+
+def test_peg_falls_back_to_profit_growth_and_says_so():
+    profit3 = ((200 / 124) ** (1 / 3) - 1) * 100
+    f = _with_pe_and_eps(14.2, None)                     # no EPS row on the page
+    assert metric(f, "eps_cagr_3y")["value"] is None
+    peg, c = metric(f, "peg"), checks(f)["Growth justifies the P/E"]
+    assert peg["value"] == pytest.approx(14.2 / round(profit3, 2), abs=0.006)
+    assert peg["note"] == (f"P/E 14.2 ÷ 3y net profit CAGR {profit3:.1f} %; no 3y EPS CAGR (row not on the page), "
+                           "so net profit growth stands in")
+    assert c["pass"] is True and c["rule"] == "PEG (P/E ÷ 3y net profit CAGR; EPS CAGR unavailable) < 1.5"
+
+
 # ------------------------------------------------------------------ client (httpx.MockTransport)
 class Site:
     """Fake www.screener.in: path → response or list of responses (consumed in order, last one repeats).
@@ -568,6 +620,83 @@ def test_404_is_key_error_and_bad_input(tmp_path):
         run(client(tmp_path, site).fundamentals("bad sym!"))
     with pytest.raises(ValueError):
         run(client(tmp_path, site).fundamentals("ACME", view="annual"))
+
+
+def test_404_is_remembered_without_new_requests(tmp_path):
+    site = Site({})
+    c = client(tmp_path, site)
+
+    async def ask(n, sym="NOSUCHCO", **kw):
+        for _ in range(n):
+            with pytest.raises(KeyError, match=f"{sym} is not on Screener.in"):
+                await c.fundamentals(sym, **kw)
+
+    async def go():
+        await ask(3)
+        await ask(2, refresh=True)                       # refresh does not bypass a remembered 404
+        await asyncio.gather(ask(1, "JUNK"), ask(1, "JUNK"))       # the waiter sees the first caller's 404
+        assert c._sym_locks == {}                        # no lock entry left behind per unknown symbol
+        c.missing_ttl = 0
+        c._missing.clear()
+        await ask(2)                                     # expired at once → each call asks Screener.in again
+
+    run(go())
+    assert site.paths == ["/company/NOSUCHCO/consolidated/", "/company/JUNK/consolidated/"] + \
+        ["/company/NOSUCHCO/consolidated/"] * 2
+
+
+def test_remembered_404s_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(sc.ScreenerClient, "MISSING_MAX", 3)
+    c = client(tmp_path, Site({}))
+    for sym in ("A1", "A2", "A3", "A4"):
+        with pytest.raises(KeyError):
+            run(c.fundamentals(sym))
+    assert list(c._missing) == ["A2:auto", "A3:auto", "A4:auto"]          # the oldest was forgotten
+
+
+def test_full_queue_turns_requests_away(tmp_path):
+    routes = {}
+    for sym in ("CO1", "CO2", "CO3", "CO4"):
+        routes[f"/company/{sym}/consolidated/"] = (200, HTML.replace("Acme Widgets Ltd", f"{sym} Ltd"))
+    routes["/api/company/7700001/peers/"] = (200, PEERS_HTML)
+    site = Site(routes)
+    c = client(tmp_path, site, min_interval=0.05, max_queued=2)
+
+    async def go():
+        return await asyncio.gather(*(c.fundamentals(s) for s in ("CO1", "CO2", "CO3", "CO4")),
+                                    return_exceptions=True)
+
+    res = run(go())
+    assert [r["name"] for r in res[:2]] == ["CO1 Ltd", "CO2 Ltd"]          # admitted fetches finish, with peers
+    assert all(r["peers"] is not None for r in res[:2])
+    for e in res[2:]:
+        assert type(e) is sc.ScreenerError and e.busy and str(e).startswith("busy")   # router maps it to 502
+    assert not any("CO3" in p or "CO4" in p for p in site.paths)            # turned away without a request
+    assert c._queued == 0 and c._sym_locks == {}
+    assert run(c.fundamentals("CO3"))["name"] == "CO3 Ltd"                # the queue drains, later calls work
+
+
+def test_full_queue_serves_the_cached_copy(tmp_path):
+    site = Site(acme_routes())
+    run(client(tmp_path, site).fundamentals("ACME"))
+    site.log.clear()
+    c = client(tmp_path, site, ttl_hours=0, max_queued=0)
+    f = run(c.fundamentals("ACME"))
+    assert f["cached"] is True and f["stale"] is True and site.paths == []
+    assert f["warnings"][0].startswith("Not refetched: the gateway's Screener.in queue is full")
+
+
+def test_cached_copy_follows_the_current_rules(tmp_path):
+    site = Site(acme_routes())
+    first = run(client(tmp_path, site).fundamentals("ACME"))
+    path = tmp_path / "ACME.auto.json"
+    disk = json.loads(path.read_text(encoding="utf-8"))
+    disk["fundamentals"]["derived"] = [{"key": "peg", "label": "PEG", "value": 0.1, "unit": "x", "note": "old rule"}]
+    disk["fundamentals"]["scorecard"] = {"total": 0, "max": 0, "grade": "N/A", "parts": []}
+    path.write_text(json.dumps(disk), encoding="utf-8")
+    again = run(client(tmp_path, site).fundamentals("ACME"))
+    assert again["cached"] is True and site.paths.count("/company/ACME/consolidated/") == 1
+    assert again["derived"] == first["derived"] and again["scorecard"] == first["scorecard"]
 
 
 def test_429_is_retried_once(tmp_path):

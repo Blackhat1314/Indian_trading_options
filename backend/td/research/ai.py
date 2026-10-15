@@ -48,6 +48,9 @@ STANCES = ["bullish", "moderately_bullish", "neutral", "moderately_bearish", "be
 CONFS = ["low", "medium", "high"]
 SCORE_KEYS = ("technical", "fundamental", "valuation", "momentum", "risk")
 MC_PATHS, MC_HORIZON = 5000, 756
+SPOT_GAP_PCT = 2.0                     # spot vs Screener.in's price gap (%) above which the mixed basis is flagged
+NOT_PRICED = {"INDIAVIX": "India VIX is a volatility index, not a traded price — analyse NIFTY or a stock instead"}
+MAX_JOBS = 500                         # finished jobs beyond this are evicted oldest first
 DISCLAIMER = ("Research tool, not investment advice. Every number here is a probability range estimated from "
               "past data and, where shown, an AI model's reading of it; markets can move outside any range. "
               "Check the data yourself and consult a SEBI-registered adviser before investing.")
@@ -537,7 +540,9 @@ def quant_section(q: dict) -> dict:
                    "range95": [_r(x) for x in h.get("range95") or []],
                    "oos_auc": _r(h.get("oos_auc"), 3), "oos_accuracy": _r(h.get("oos_acc"), 3),
                    "base_rate_up": _r(h.get("base_rate"), 3),
-                   "edge": _has_edge(h), "edge_note": h.get("edge_note")})
+                   "edge": _has_edge(h), "edge_note": h.get("edge_note"),
+                   # flat: calibration flattened P(up) to the base rate for every stock — not a forecast
+                   "flat": bool(h.get("flat"))})
     reg = q.get("regime")
     vol = q.get("vol")
     model = q.get("model") or {}
@@ -547,11 +552,14 @@ def quant_section(q: dict) -> dict:
                    "probs": [_r(x, 3) for x in reg.get("probs") or []],
                    "mu_annual_pct": [_pct(x, 1) for x in reg.get("mu_annual") or []],
                    "vol_annual_pct": [_pct(x, 1) for x in reg.get("vol_annual") or []],
-                   "expected_duration_days": [_r(x, 1) for x in reg.get("expected_duration") or []]} if reg else None,
+                   "expected_duration_days": [_r(x, 1) for x in reg.get("expected_duration") or []],
+                   "fit_window": (f"{reg.get('fit_start')} to {reg.get('fit_end')}"
+                                  if reg.get("fit_start") and reg.get("fit_end") else None)} if reg else None,
         "volatility_pct": {k: _pct(v, 1) for k, v in vol.items() if k != "percentile"} if vol else None,
         "volatility_percentile": _r(vol.get("percentile"), 3) if vol else None,
         "components": [{"label": c.get("label"), "display": c.get("display"), "z": _r(c.get("z")),
                         "reading": c.get("reading"), "tone": c.get("tone")} for c in q.get("components") or []],
+        "contributions_flat": bool(q.get("contributions_flat")),
         "top_contributions_1m_log_odds": [{"feature": c.get("label") or c.get("feature"),
                                            "value": _r(c.get("value"), 3), "contribution": _r(c.get("contribution"), 3)}
                                           for c in (q.get("contributions") or [])[:6]],
@@ -659,7 +667,9 @@ def market_section(nifty: dict | None, vix: dict | None, ctx: dict | None, symbo
     live = None
     if snap:
         idx = {str(i.get("name")): i for i in snap.get("indices") or [] if isinstance(i, dict)}
-        b = snap.get("breadth") or {}
+        b = snap.get("breadth") if isinstance(snap.get("breadth"), dict) else {}
+        if not (_num(b.get("n")) or (_num(b.get("adv")) or 0) + (_num(b.get("dec")) or 0)):
+            b = {}                          # analytics' sentinel before any tick ({adv: 0, dec: 0, n: 0}): no reading
         sectors = [s for s in snap.get("sectors") or [] if isinstance(s, dict)]
         sec = None
         own = ctx.get("sector") if isinstance(ctx.get("sector"), dict) else {}
@@ -748,10 +758,12 @@ async def _build(symbol: str, data, screener, quant, step: Callable | None, mc, 
     # ---- resolve
     await _call_step(step, "resolve", "running")
     sector = None
+    is_index = False
     try:
         info = await guarded(data.resolve(sym), 30)
         raw["name"] = _get(info, "name") or sym
         sector = _get(info, "sector")
+        is_index = _get(info, "kind") == "IDX"
         raw["identity"] = {"symbol": sym, "name": raw["name"], "sector": sector, "kind": _get(info, "kind"),
                            "in_fno_universe": _get(info, "in_universe")}
         await _call_step(step, "resolve", "done", f"{raw['name']} · {sector or 'sector n/a'}")
@@ -759,8 +771,9 @@ async def _build(symbol: str, data, screener, quant, step: Callable | None, mc, 
         gaps.append(f"Symbol details ({_err(e)})")
         await _call_step(step, "resolve", "error", _err(e))
 
-    # the slow network sources start now and run while the price work happens
-    f_task = asyncio.create_task(guarded(screener.fundamentals(sym), 150)) if screener is not None else None
+    # the slow network sources start now and run while the price work happens (an index has no Screener page)
+    f_task = (asyncio.create_task(guarded(screener.fundamentals(sym), 150))
+              if screener is not None and not is_index else None)
     q_task = asyncio.create_task(guarded(quant.result(sym), 90)) if quant is not None else None
     tasks += [t for t in (f_task, q_task) if t is not None]
 
@@ -824,7 +837,9 @@ async def _build(symbol: str, data, screener, quant, step: Callable | None, mc, 
     # ---- fundamentals
     await _call_step(step, "fundamentals", "running")
     fdata: dict | None = None
-    if f_task is None:
+    if is_index:
+        await _call_step(step, "fundamentals", "skipped", "indices have no company fundamentals")
+    elif f_task is None:
         await _call_step(step, "fundamentals", "skipped", "Screener client not configured")
         gaps.append("Fundamentals (no Screener client)")
     else:
@@ -844,17 +859,33 @@ async def _build(symbol: str, data, screener, quant, step: Callable | None, mc, 
         except Exception as e:
             gaps.append(f"Fundamentals from Screener.in ({_err(e)})")
             await _call_step(step, "fundamentals", "error", _err(e))
-    if _num(spot) is None and fdata:
-        cp = next((r.get("value") for r in fdata.get("ratios") or [] if r.get("key") == "current_price"), None)
-        if _num(cp):
-            spot, spot_src = float(cp), "screener"
+    scr_price = _num(next((r.get("value") for r in (fdata or {}).get("ratios") or []
+                           if r.get("key") == "current_price"), None))
+    if scr_price is not None and scr_price <= 0:
+        scr_price = None
+    if _num(spot) is None and scr_price is not None:
+        spot, spot_src = scr_price, "screener"
     spot = _num(spot)
     if spot is not None:
         raw["price"] = {"spot": _r(spot), "spot_source": spot_src,
+                        "spot_date": _today() if spot_src in ("live", "screener") else
+                        (tech["last_date"] if tech else raw["asof"]),
                         "last_close": tech["last_close"] if tech else None,
                         "last_bar_date": tech["last_date"] if tech else None,
                         "bars": tech["bars"] if tech else 0,
                         "history_years": tech["history_years"] if tech else 0}
+        if scr_price is not None and spot_src != "screener":
+            # valuation ratios use Screener's price, every target and return the spot: say so when they disagree
+            gap = (scr_price / spot - 1) * 100
+            raw["price"].update(screener_price=_r(scr_price), screener_fetched=(raw["fundamentals"] or {}).get(
+                "fetched"), screener_vs_spot_pct=_r(gap))
+            if abs(gap) > SPOT_GAP_PCT:
+                basis = (f"the live price {_inr(spot)}" if spot_src == "live" else
+                         f"the last close {_inr(spot)} ({raw['price']['spot_date'] or 'date n/a'})")
+                warns.append(f"Price basis differs: targets and returns are measured from {basis}, while "
+                             f"Screener.in's valuation ratios use its price of {_inr(scr_price)} ({_sp(gap)}).")
+                gaps.append(f"One price basis for targets and valuation (targets use {basis}; Screener.in's "
+                            f"ratios use {_inr(scr_price)}, {_sp(gap)})")
     else:
         gaps.append("A current price (no history, live quote or Screener price)")
 
@@ -952,6 +983,11 @@ async def _build(symbol: str, data, screener, quant, step: Callable | None, mc, 
         raw["market"] = market_section(index_view(nifty_df), vix_view(vix_df), ctx, sym, sector)
         if raw["market"]["india_vix"] is None:
             gaps.append("India VIX history")
+        live = raw["market"]["live_session"]
+        if live is None:
+            gaps.append("Live market breadth and sector moves (no analytics snapshot)")
+        elif live.get("breadth") is None:
+            gaps.append("Live market breadth (no ticks in the analytics snapshot)")
         nv = raw["market"]["nifty"]
         await _call_step(step, "market", "done",
                          f"NIFTY 1Y {_sp(nv['returns_pct']['1Y'])} · {nv['regime'] or ''}" if nv else "partial")
@@ -986,6 +1022,23 @@ def _fact(label: str, value: Any) -> dict:
     return {"label": label, "value": value if isinstance(value, str) else ("n/a" if value is None else str(value))}
 
 
+def longest_drawdown(dd: dict) -> tuple[str | None, float | None]:
+    """Max drawdown over the longest window available, with its label: 5Y, else the full history when it is
+    shorter (technicals() keys it '<n>Y (all history)'), else 1Y."""
+    for k in ("5Y", *[k for k in dd if "all history" in str(k)], "1Y"):
+        v = _num(dd.get(k))
+        if v is not None:
+            return k, v
+    return None, None
+
+
+def _drawdown_fact(dd: dict) -> dict:
+    key, v = longest_drawdown(dd)
+    if key in (None, "1Y"):
+        return _fact("Max drawdown 1Y", _p(dd.get("1Y")))
+    return _fact(f"Max drawdown 1Y / {key}", f"{_p(dd.get('1Y'))} / {_p(v)}")
+
+
 def display_dossier(raw: dict) -> dict:
     secs: list[dict] = []
     ident = raw.get("identity") or {}
@@ -998,7 +1051,15 @@ def display_dossier(raw: dict) -> dict:
     facts.append(_fact("Price data", "simulated" if raw.get("data_source") == "sim" else "Dhan / lake"))
     pr = raw.get("price")
     if pr:
-        facts.append(_fact("Spot", f"{_inr(pr['spot'])} ({pr['spot_source']})"))
+        when = f", {pr['spot_date']}" if pr.get("spot_date") else ""
+        facts.append(_fact("Spot", f"{_inr(pr['spot'])} ({pr['spot_source']}{when})"))
+        if _num(pr.get("screener_price")) is not None:
+            gap = _num(pr.get("screener_vs_spot_pct"))
+            flag = (" — targets use the spot, valuation ratios Screener's price"
+                    if gap is not None and abs(gap) > SPOT_GAP_PCT else "")
+            fetched = pr.get("screener_fetched") or "n/a"
+            facts.append(_fact("Screener.in price",
+                               f"{_inr(pr['screener_price'])} (fetched {fetched}; {_sp(gap)} vs spot){flag}"))
         if pr.get("last_bar_date"):
             facts.append(_fact("History", f"{pr['bars']} sessions, {pr['history_years']} years to "
                                           f"{pr['last_bar_date']}"))
@@ -1013,7 +1074,7 @@ def display_dossier(raw: dict) -> dict:
                  _fact("CAGR 3Y / 5Y", " / ".join(_sp(t["cagr_pct"][k]) for k in ("3Y", "5Y"))),
                  _fact("Volatility 1M / 1Y (annualised)",
                        " / ".join(_p(t["volatility_pct"][k]) for k in ("1M", "1Y"))),
-                 _fact("Max drawdown 1Y / 5Y", " / ".join(_p(t["max_drawdown_pct"][k]) for k in ("1Y", "5Y"))),
+                 _drawdown_fact(t.get("max_drawdown_pct") or {}),
                  _fact("From 1-year high", _sp(t["drawdown_from_1y_high_pct"]))]
         for k in (50, 200):
             if f"sma{k}" in ma:
@@ -1059,7 +1120,9 @@ def display_dossier(raw: dict) -> dict:
                                f"P(up) {h['p_up']} · {h['signal']} · {h['confidence']} confidence "
                                f"(walk-forward AUC {auc if auc is not None else 'n/a'}{edge})"))
         if q.get("regime"):
-            facts.append(_fact("Regime", f"{q['regime']['state']} (probs {q['regime']['probs']})"))
+            win = q["regime"].get("fit_window")
+            facts.append(_fact("Regime", f"{q['regime']['state']} (probs {q['regime']['probs']})"
+                               + (f"; HMM fitted on {win}" if win else "")))
         if q.get("volatility_pct"):
             v = q["volatility_pct"]
             facts.append(_fact("Volatility now / long-run", f"{_p(v.get('garch_now'))} / {_p(v.get('long_run'))}"))
@@ -1078,7 +1141,13 @@ def display_dossier(raw: dict) -> dict:
                                                  f"{_inr(h['p50'])} ({_sp(h['median_ret_pct'])}){up}"))
         cal = m.get("calibration")
         if cal and cal.get("verdict"):
-            facts.append(_fact("Calibration", cal["verdict"]))
+            # the backtest checks one forecast length only; say which, and that the longer ranges were not checked
+            days = _num(cal.get("horizon_days"))
+            facts.append(_fact(f"Calibration ({int(days)}-day forecasts)" if days else "Calibration", cal["verdict"]))
+            longer = [label for label, d in HORIZONS if days and d > days + 5 and label in m["horizons"]]
+            if longer:
+                facts.append(_fact(f"{longer[0]}–{longer[-1]} ranges" if len(longer) > 1 else f"{longer[0]} range",
+                                   f"not backtested — only the {int(days)}-day forecasts were checked"))
         secs.append({"key": "montecarlo", "title": "Monte Carlo", "facts": facts})
 
     mk = raw.get("market")
@@ -1122,7 +1191,8 @@ def user_prompt(raw: dict) -> str:
     pr = raw.get("price") or {}
     lines = [f"Stock: {raw['symbol']} — {raw.get('name')}",
              f"Analysis date: {raw.get('analysis_date')}; price data as of {raw.get('asof') or 'n/a'}",
-             f"Spot price: {_inr(pr.get('spot'))} ({pr.get('spot_source') or 'n/a'})"]
+             f"Spot price: {_inr(pr.get('spot'))} ({pr.get('spot_source') or 'n/a'}"
+             + (f", {pr['spot_date']})" if pr.get("spot_date") else ")")]
     m = raw.get("monte_carlo")
     if m and m.get("horizons"):
         lines.append(f"Statistical anchor — {m['method']}; drift {_p(m.get('drift_annual_pct'))} a year "
@@ -1134,17 +1204,21 @@ def user_prompt(raw: dict) -> str:
         lines.append("No Monte Carlo distribution is available: derive ranges from the volatility in the dossier "
                      "and say that they are rough.")
     dossier = {k: v for k, v in raw.items() if k not in ("name",)}
+    # headlines and Screener text are untrusted: escape < and > (still valid JSON) so no text can close the block
+    body = json.dumps(dossier, ensure_ascii=False, default=str).replace("<", "\\u003c").replace(">", "\\u003e")
     lines += ["", "Dossier (JSON; percent values in fields ending in _pct; money in rupees unless a table's unit "
-                  "says Rs. Crores):", "<dossier>", json.dumps(dossier, ensure_ascii=False, default=str), "</dossier>",
+                  "says Rs. Crores):", "<dossier>", body, "</dossier>",
               "", "Write the report for the 6M, 1Y, 2Y and 3Y horizons."]
     return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ rule-based baseline
-_WEIGHTS = {"6M": {"technical": 0.35, "quant": 0.25, "fundamental": 0.25, "mc": 0.15},
-            "1Y": {"technical": 0.25, "quant": 0.10, "fundamental": 0.40, "mc": 0.25},
-            "2Y": {"technical": 0.10, "quant": 0.0, "fundamental": 0.55, "mc": 0.35},
-            "3Y": {"technical": 0.05, "quant": 0.0, "fundamental": 0.60, "mc": 0.35}}
+# The Monte Carlo is not an input: its CAPM drift makes the simulated median a function of beta and volatility
+# only (no view on the stock), so it sets the targets and ranges and never the stance.
+_WEIGHTS = {"6M": {"technical": 0.35, "quant": 0.25, "fundamental": 0.25},
+            "1Y": {"technical": 0.25, "quant": 0.10, "fundamental": 0.40},
+            "2Y": {"technical": 0.10, "quant": 0.0, "fundamental": 0.55},
+            "3Y": {"technical": 0.05, "quant": 0.0, "fundamental": 0.60}}
 
 
 def _stance(score: float) -> str:
@@ -1197,20 +1271,15 @@ def _horizon_baseline(raw: dict, label: str, sig: dict) -> dict | None:
     spot = _num((raw.get("price") or {}).get("spot"))
     if not h or not spot or not all(_num(h.get(k)) for k in ("p10", "p25", "p50", "p75", "p90")):
         return None
-    rf = settings.risk_free_rate * 100
     inputs = dict(technical=sig["technical"], quant=sig["quant"], fundamental=sig["fundamental"])
-    if _num(h.get("ann_median_ret_pct")) is not None:
-        inputs["mc"] = (_clip((h["ann_median_ret_pct"] - rf) / 8),
-                        f"simulated median {_sp(h['ann_median_ret_pct'])}/yr vs risk-free {rf:.1f}%")
     w = _WEIGHTS[label]
     used = {k: v for k, v in inputs.items() if v is not None and w.get(k, 0) > 0}
     tot_w = sum(w[k] for k in used)
     score = sum(w[k] * used[k][0] for k in used) / tot_w if tot_w else 0.0
     signs = {np.sign(round(v[0], 2)) for v in used.values()} - {0}
     conf = "medium" if abs(score) >= 0.35 and len(used) >= 3 and len(signs) <= 1 else "low"
-    names = {"technical": "Trend", "quant": "Quant", "fundamental": "Fundamentals", "mc": "Monte Carlo"}
-    blend = "; ".join(f"{names[k].lower() if k != 'mc' else names[k]} {v[0]:+.2f} × {w[k] / tot_w:.0%} ({v[1]})"
-                      for k, v in used.items())
+    names = {"technical": "Trend", "quant": "Quant", "fundamental": "Fundamentals"}
+    blend = "; ".join(f"{names[k].lower()} {v[0]:+.2f} × {w[k] / tot_w:.0%} ({v[1]})" for k, v in used.items())
     excluded = [n for n in (sig.get("quant_note"),) if n and label in ("6M", "1Y")]
     scen = []
     for name, key, prob in (("bear", "p10", 0.25), ("base", "p50", 0.5), ("bull", "p90", 0.25)):
@@ -1224,15 +1293,17 @@ def _horizon_baseline(raw: dict, label: str, sig: dict) -> dict | None:
     rationale = (f"Rule-based blend → score {score:+.2f} ({_stance(score).replace('_', ' ')}): "
                  f"{blend or 'no inputs'}."
                  + (f" {excluded[0][0].upper() + excluded[0][1:]}." if excluded else "")
-                 + f" Targets are the 10th/50th/90th percentiles of the {kind}; the expected range is "
-                   f"its 25th–75th percentile. This is a statistical baseline, not a forecast.")
+                 + f" The score sets the stance only and does not move the targets: they are the 10th/50th/90th "
+                   f"percentiles of the {kind} (CAPM drift, no view on the stock) and the range is its 25th–75th "
+                   f"percentile. This is a statistical baseline, not a forecast.")
     drivers = [f"{names[k]}: {v[1]}" for k, v in used.items() if v[0] > 0.1]
     risks = [f"{names[k]}: {v[1]}" for k, v in used.items() if v[0] < -0.1]
     risks.append(f"Simulated {label} 5th percentile {_inr(h['p5'])} ({_sp(h.get('p5_ret_pct'))})")
     t = raw.get("technicals") or {}
     vol = _num((t.get("volatility_pct") or {}).get("1Y"))
     if vol is not None:
-        risks.append(f"Volatility {_p(vol)} a year; 1Y max drawdown {_p((t.get('max_drawdown_pct') or {}).get('1Y'))}")
+        dd_key, dd = longest_drawdown(t.get("max_drawdown_pct") or {})
+        risks.append(f"Volatility {_p(vol)} a year" + (f"; {dd_key} max drawdown {_p(dd)}" if dd_key else ""))
     return {"horizon": label, "stance": _stance(score), "confidence": conf,
             "expected_return_low_pct": _r((h["p25"] / spot - 1) * 100),
             "expected_return_high_pct": _r((h["p75"] / spot - 1) * 100),
@@ -1263,23 +1334,38 @@ def _views(raw: dict) -> dict[str, str]:
     else:
         out["technical_view"] = "No price history was available, so there is no technical view."
     if f:
-        d = {m["key"]: m for m in f.get("derived_metrics") or []}
+        d = {m["key"]: m for m in f.get("derived_metrics") or [] if m.get("key")}
+        # lenders: Screener reports a Financing Margin in place of OPM and marks ROCE, debt/equity, interest
+        # coverage and cash conversion as not meaningful, so they are judged on ROE, ROA and NPAs instead
+        lender = (any("not meaningful for banks" in str(m.get("note") or "") for m in d.values())
+                  or str((d.get("opm_latest") or {}).get("metric") or "").lower() == "financing margin")
 
         def dm(key: str) -> str:
             return _with_unit(d[key]["value"], d[key]["unit"]) if key in d else "n/a"
 
         def listed(items: list[tuple[str, str]]) -> str:
-            got = [f"{label} {dm(key)}" for label, key in items if dm(key) != "n/a"]
+            """Each metric under its own label (Screener's page decides what a row means, e.g. Revenue vs
+            Sales), leaving out the ones the metric itself marks as not meaningful."""
+            got = []
+            for short, key in items:
+                m = d.get(key) or {}
+                own = str(m.get("metric") or "").strip()
+                meaningless = "not meaningful" in str(m.get("note") or "") or own.lower() == "financing margin"
+                if dm(key) == "n/a" or meaningless:
+                    continue
+                got.append(f"{own or short} {dm(key)}")
             return "; ".join(got)
 
         sc = f.get("scorecard") or {}
-        growth = listed([("sales CAGR 3y", "sales_cagr_3y"), ("net profit CAGR 3y", "profit_cagr_3y"),
-                         ("latest quarter sales YoY", "qtr_sales_yoy"),
-                         ("latest quarter profit YoY", "qtr_profit_yoy")])
-        quality = listed([("ROCE", "roce"), ("ROE", "roe"), ("operating margin", "opm_latest"),
-                          ("cash conversion 3y", "cash_conversion_3y")])
-        health = listed([("debt/equity", "debt_to_equity"), ("interest coverage", "interest_coverage"),
-                         ("promoter holding change 4Q", "promoter_change_4q"),
+        growth = listed([("Sales CAGR 3y", "sales_cagr_3y"), ("Net profit CAGR 3y", "profit_cagr_3y"),
+                         ("Latest quarter sales YoY", "qtr_sales_yoy"),
+                         ("Latest quarter net profit YoY", "qtr_profit_yoy")])
+        quality = listed([("Return on equity", "roe"), ("Return on assets", "roa"), ("Gross NPA", "gross_npa"),
+                          ("Net NPA", "net_npa")] if lender else
+                         [("Return on capital employed", "roce"), ("Return on equity", "roe"),
+                          ("Operating margin", "opm_latest"), ("Cash conversion 3y", "cash_conversion_3y")])
+        health = listed([("Debt / equity", "debt_to_equity"), ("Interest coverage", "interest_coverage"),
+                         ("Promoter holding change 4Q", "promoter_change_4q"),
                          ("FII + DII change 4Q", "fii_dii_change_4q")])
         out["fundamental_view"] = " ".join(x for x in [
             f"Screener scorecard grade {sc.get('grade', 'n/a')} ({sc.get('total')}/{sc.get('max')})." if sc else "",
@@ -1290,7 +1376,7 @@ def _views(raw: dict) -> dict[str, str]:
         val_part = (sc.get("parts") or {}).get("valuation")
         ratios = "; ".join(f"{k} {str(tr[k]).rstrip('.')}" for k in ("Stock P/E", "Market Cap", "Book Value",
                                                                       "Dividend Yield") if k in tr)
-        derived = listed([("price/book", "price_to_book"), ("earnings yield", "earnings_yield"), ("PEG", "peg"),
+        derived = listed([("Price / book", "price_to_book"), ("Earnings yield", "earnings_yield"), ("PEG", "peg"),
                           ("P/E vs peer median", "pe_vs_peers")])
         out["valuation_view"] = " ".join(x for x in [
             f"{ratios}." if ratios else "",
@@ -1298,6 +1384,9 @@ def _views(raw: dict) -> dict[str, str]:
             f"Valuation checks passed {val_part['score']}/{val_part['max']}."
             if val_part and val_part.get("max") else ""]
             if x) or "Screener.in gave no valuation ratios."
+    elif (raw.get("identity") or {}).get("kind") == "IDX":
+        out["fundamental_view"] = f"{raw['symbol']} is an index, so there are no company fundamentals to read."
+        out["valuation_view"] = "An index has no Screener.in valuation ratios here."
     else:
         out["fundamental_view"] = "Fundamentals from Screener.in were not available, so there is no fundamental view."
         out["valuation_view"] = "Without Screener.in data there is no valuation view."
@@ -1322,8 +1411,9 @@ def _views(raw: dict) -> dict[str, str]:
 
 
 def baseline_report(raw: dict, display: dict | None = None, reason: str = "") -> dict:
-    """Rule-based AiReport (ai=false) from the dossier alone: transparent blend of trend, quant (only with measured
-    edge), Screener scorecard and the Monte Carlo median vs the risk-free rate; scenarios are MC p10/p50/p90."""
+    """Rule-based AiReport (ai=false) from the dossier alone: the stance is a transparent blend of trend, quant (only
+    with measured edge) and the Screener scorecard; scenarios are the Monte Carlo p10/p50/p90 and the range its
+    p25–p75, untouched by the stance (a CAPM-drift simulation carries no view on the stock)."""
     sig = _signals(raw)
     horizons = []
     for label, _ in HORIZONS:
@@ -1340,7 +1430,7 @@ def baseline_report(raw: dict, display: dict | None = None, reason: str = "") ->
     mom_parts = [x for x in (_clip(mom / 30) if mom is not None else None, _clip(rs / 20) if rs is not None else None)
                  if x is not None]
     vol = _num((t.get("volatility_pct") or {}).get("1Y"))
-    mdd = _num((t.get("max_drawdown_pct") or {}).get("5Y") or (t.get("max_drawdown_pct") or {}).get("1Y"))
+    mdd_key, mdd = longest_drawdown(t.get("max_drawdown_pct") or {})
     val_part = (sc.get("parts") or {}).get("valuation") or {}
     score = {
         "technical": round(5 + 5 * tech_s, 1),
@@ -1378,7 +1468,8 @@ def baseline_report(raw: dict, display: dict | None = None, reason: str = "") ->
             if ch.get("result") == "fail" and len(risks_list) < 7:
                 risks_list.append(f"Fails \"{ch['check']}\": {ch['value']} (rule: {ch['rule']})")
     if vol is not None:
-        risks_list.append(f"Annualised volatility {_p(vol)}; 5Y max drawdown {_p(mdd)}")
+        risks_list.append(f"Annualised volatility {_p(vol)}"
+                          + (f"; {mdd_key} max drawdown {_p(mdd)}" if mdd_key else ""))
     ma = t.get("moving_averages") or {}
     sr = t.get("support_resistance") or {}
     if ma.get("sma200"):
@@ -1407,12 +1498,14 @@ def baseline_report(raw: dict, display: dict | None = None, reason: str = "") ->
         "disclaimer": DISCLAIMER}
     for h in report["horizons"]:
         base_target = next(s for s in h["scenarios"] if s["name"] == "base")["target_price"]
-        h["mc_check"] = mc_check(raw, h["horizon"], base_target)
+        h["mc_check"] = mc_check(raw, h["horizon"], base_target, by_construction=True)
     return report
 
 
 # ------------------------------------------------------------------ model answer → AiReport
-def mc_check(raw: dict, label: str, base_target: float | None) -> dict | None:
+def mc_check(raw: dict, label: str, base_target: float | None, by_construction: bool = False) -> dict | None:
+    """Base target vs the simulated 5–95 % band. `by_construction`: the rule-based view, whose base target IS the
+    simulated median, so "inside the band" would be no check at all and the note says so instead."""
     m = raw.get("monte_carlo") or {}
     h = (m.get("horizons") or {}).get(label)
     if not h or _num(base_target) is None or not all(_num(h.get(k)) for k in ("p5", "p50", "p95")):
@@ -1424,7 +1517,10 @@ def mc_check(raw: dict, label: str, base_target: float | None) -> dict | None:
           (90, h.get("p90")), (95, h.get("p95"))]
     qs = [(p, v) for p, v in qs if _num(v) is not None]
     src = m.get("kind", "Monte Carlo")
-    if inside:
+    if by_construction:
+        note = (f"Base target {_inr(base_target)} = the {src} median by construction (rule-based view), so this is "
+                f"not an independent check (5–95%: {_inr(p5)} – {_inr(p95)}).")
+    elif inside:
         pctl = float(np.interp(base_target, [v for _, v in qs], [p for p, _ in qs]))
         note = (f"Base target {_inr(base_target)} sits near the {_ordinal(round(pctl))} percentile of the {src} "
                 f"(5–95%: {_inr(p5)} – {_inr(p95)}).")
@@ -1511,6 +1607,7 @@ def model_report(data: dict, raw: dict, display: dict, *, provider: str, model: 
         given = {}
     for label, _ in HORIZONS:
         hv = _fix_horizon(given[label], spot, warns) if label in given else None
+        rule_based = hv is None
         if hv is None:
             if label in base_h:
                 warns.append(f"{label}: the model gave no usable view; the rule-based view is shown instead.")
@@ -1518,9 +1615,12 @@ def model_report(data: dict, raw: dict, display: dict, *, provider: str, model: 
             else:
                 continue
         base_target = next((s["target_price"] for s in hv["scenarios"] if s.get("name") == "base"), None)
-        hv["mc_check"] = mc_check(raw, label, base_target)
+        hv["mc_check"] = mc_check(raw, label, base_target, by_construction=rule_based)
         horizons.append(hv)
-    score = {k: round(_clip(_num((data.get("score") or {}).get(k)) or 5.0, 0, 10), 1) for k in SCORE_KEYS}
+    score = {}
+    for k in SCORE_KEYS:
+        v = _num((data.get("score") or {}).get(k))                 # 0 is a valid extreme, not a missing score
+        score[k] = round(_clip(5.0 if v is None else v, 0, 10), 1)
     gaps = list(raw.get("data_gaps") or [])
     gaps += [g for g in _clean_list(data.get("data_gaps"), 10) if g not in gaps]
 
@@ -1583,18 +1683,22 @@ class AiService:
 
     async def start(self, symbol: str, user: str | None, is_admin: bool, refresh: bool = False) -> dict:
         sym = symbol.strip().upper()
+        if sym in NOT_PRICED:                         # → 422: no price targets for something that is not a price
+            raise ValueError(NOT_PRICED[sym])
         self._prune()
         running = self._active.get(sym)
         if running in self._jobs:
             return self._public(self._jobs[running])
         if not refresh:
-            cached = self._load(sym, _today())
+            cached = await asyncio.to_thread(self._load, sym, _today())
             if cached is not None and (cached.get("ai") or not self.llm.enabled):
-                job = self._new_job(sym)
+                # answered at once and never polled, so it is not kept in the job table (repeated requests for a
+                # cached report must not pile up copies of it in memory)
+                job = self._new_job(sym, register=False)
                 for s in job["steps"]:
                     s.update(status="done", detail="from today's earlier analysis")
                 job.update(status="done", result=cached, cached=True, finished=time.time())
-                return self._public(job)
+                return job
         await self.data.resolve(sym)                  # unknown symbol → KeyError for the caller (404)
         running = self._active.get(sym)               # another request may have started it meanwhile
         if running in self._jobs:
@@ -1624,11 +1728,16 @@ class AiService:
         return None
 
     # ---- jobs
-    def _new_job(self, sym: str) -> dict:
+    def _new_job(self, sym: str, register: bool = True) -> dict:
         job = {"id": uuid.uuid4().hex[:16], "symbol": sym, "status": "queued",
                "steps": [{"key": k, "label": label, "status": "pending", "detail": ""} for k, label in STEPS],
                "result": None, "error": None, "cached": False, "started": time.time(), "finished": None}
-        self._jobs[job["id"]] = job
+        if register:
+            if len(self._jobs) >= MAX_JOBS:           # backstop: evict the oldest finished jobs (running ones stay)
+                done = sorted((j["finished"], jid) for jid, j in self._jobs.items() if j["finished"] is not None)
+                for _, jid in done[:len(self._jobs) - MAX_JOBS + 1]:
+                    del self._jobs[jid]
+            self._jobs[job["id"]] = job
         return job
 
     @staticmethod
@@ -1660,7 +1769,14 @@ class AiService:
                 job["status"] = "running"
                 raw, display = await build_dossier(sym, self.data, self.screener, self.quant, step, mc=self.mc)
                 report = await self._analyse(raw, display, user, is_admin, step)
-                await asyncio.to_thread(self._save, sym, report)
+                prev = None if report.get("ai") else await asyncio.to_thread(self._load, sym, _today())
+                if prev is not None and prev.get("ai"):
+                    # a re-run that fell back to the rules (quota, model error) must not replace today's AI report
+                    report["warnings"].insert(min(1, len(report["warnings"])),
+                                              "Today's earlier AI analysis stays the saved report; this rule-based "
+                                              "view was not saved over it (ANALYSE opens the AI report).")
+                else:
+                    await asyncio.to_thread(self._save, sym, report)
                 job.update(result=report, status="done", finished=time.time())
         except Exception as e:
             log.exception("AI analysis of %s failed", sym)

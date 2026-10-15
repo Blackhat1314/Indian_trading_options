@@ -2,14 +2,17 @@
 predictability, the math helpers match known answers, the model JSON round-trips and QuantService answers in the
 QuantResult / QuantModelInfo / QuantLeaderboard shapes of frontend/src/lib/research.ts."""
 import asyncio
+import copy
 import itertools
 import json
 import math
+import time
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from td.research import montecarlo as mc
 from td.research import quant as q
 
 
@@ -223,6 +226,100 @@ def test_predict_without_enough_history(ar_model):
     assert out["chart"] is not None and out["components"]
 
 
+def _with_spreads(model, **b):
+    """A copy of the model with some horizons' calibration spreads replaced, e.g. _with_spreads(m, h21=0.0)."""
+    m = copy.deepcopy(model)
+    for k, v in b.items():
+        m.horizons[int(k[1:])].calib_b = v
+    return m
+
+
+def test_flat_horizon_reports_the_base_rate_without_tilt(ar_model):
+    model, _ = ar_model
+    frames, nifty = panel(16, 1000, 0.15, seed=7)
+    assert model.horizons[1].metrics["edge"] is True             # the stored metrics still claim an edge at 1D
+    flat = _with_spreads(model, h1=0.05, h21=0.0)                # 0.05: just under MIN_CALIB_B, still flattened
+    outs = [q.predict(flat, s, frames[s], nifty) for s in ("S02", "S09")]
+    for out in outs:
+        by = {h["h"]: h for h in out["horizons"]}
+        for h in (1, 21):
+            hz = by[h]
+            # the same P(up) for every stock (the base rate), no expected move, the median at spot
+            assert hz["flat"] is True and hz["p_up"] == round(flat.horizons[h].base, 4)
+            assert hz["exp_ret"] == 0 and hz["price_median"] == out["spot"]
+            assert hz["range68"][0] < out["spot"] < hz["range68"][1]
+            assert hz["edge"] is False and hz["signal"] == "NEUTRAL" and hz["confidence"] == "low"
+        assert by[5]["flat"] is False
+        # the 1-month probability depends on no input: no contributions, and the cone has no tilt
+        assert out["contributions"] == [] and out["contributions_flat"] is True
+        assert all(p["p50"] == out["spot"] for p in out["chart"]["forecast"])
+    assert outs[0]["horizons"][2]["p_up"] == outs[1]["horizons"][2]["p_up"]
+
+
+def test_contributions_are_their_effect_on_the_shown_probability(ar_model):
+    model, _ = ar_model
+    frames, nifty = panel(16, 1000, 0.15, seed=7)
+    df = frames["S04"]
+    half, full = _with_spreads(model, h21=0.5), _with_spreads(model, h21=1.0)
+    a, b = q.predict(half, "S04", df, nifty), q.predict(full, "S04", df, nifty)
+    assert a["contributions_flat"] is False and len(a["contributions"]) == 10
+    ca = {c["feature"]: c["contribution"] for c in a["contributions"]}
+    cb = {c["feature"]: c["contribution"] for c in b["contributions"]}
+    assert ca.keys() == cb.keys()
+    for k, v in ca.items():                                    # scaled by the calibration spread b
+        assert v == pytest.approx(0.5 * cb[k], abs=1e-4)
+    # each push is exactly how far the displayed (calibrated) log-odds move when that input sits at its mean
+    hm = half.horizons[21]
+    z = q._model_inputs(half, "S04", df, nifty).z[-1]
+    for c in a["contributions"][:3]:
+        j = q.FI[c["feature"]]
+        z0 = z.copy()
+        z0[j] = hm.mean[j]
+        d = float(q._logit(hm.p_up(z[None, :]))[0] - q._logit(hm.p_up(z0[None, :]))[0])
+        assert d == pytest.approx(c["contribution"], abs=1e-3)
+
+
+def _regime_bars(seed: int = 3) -> pd.DataFrame:
+    """≈ 6.4 years of returns alternating calm up-trends and volatile sell-offs."""
+    rng = np.random.default_rng(seed)
+    parts = [m + s * rng.standard_normal(k) for m, s, k in
+             ((0.0008, 0.009, 420), (-0.0015, 0.024, 160), (0.0006, 0.010, 500), (-0.0010, 0.022, 180),
+              (0.0007, 0.009, 350))]
+    return bars(np.concatenate(parts), seed=seed)
+
+
+def test_displayed_regime_is_the_monte_carlo_fit_on_the_latest_window(ar_model):
+    df = _regime_bars()
+    _, nifty = panel(1, df.shape[0], 0.0, seed=5)
+    out = q.predict(None, "REGX", df, nifty)
+    reg = out["regime"]
+    sim = mc.simulate(df, horizon_days=21, paths=200, model="regime", drift="zero", lookback_years=5.0)
+    mr = sim["inputs"]["regime"]
+    # same window, same states, same probabilities today, same volatilities and spells as the Monte Carlo desk
+    assert (reg["fit_start"], reg["fit_end"]) == (sim["inputs"]["first"], sim["inputs"]["last"])
+    assert reg["fit_end"] == out["asof"] and reg["fit_start"] > q._date(int(df["ts"].iat[0]))   # the last 5 years
+    assert reg["fit_years"] == pytest.approx(5.0, abs=0.05)
+    assert reg["labels"] == mr["labels"]
+    np.testing.assert_allclose(reg["probs"], mr["probs"], atol=2e-4)
+    np.testing.assert_allclose(reg["mu_annual"], mr["mu_annual"], rtol=1e-3)
+    np.testing.assert_allclose(reg["vol_annual"], mr["vol_annual"], rtol=1e-3)
+    np.testing.assert_allclose([1 - 1 / d for d in reg["expected_duration"]], mr["p_stay"], atol=1e-4)
+    named = {"bull": 1, "bear": 0}.get(reg["state"], int(np.argmax(reg["probs"])))
+    assert named == mr["current"]
+    # the regime gauge and the chart's shading read the same fit; the model's own (causal) HMM fit is named
+    comp = next(c for c in out["components"] if c["key"] == "regime")
+    assert comp["value"] == pytest.approx(reg["probs"][1], abs=1e-4)
+    assert reg["fit_start"] in comp["reading"] and reg["fit_end"] in comp["reading"]
+    assert out["chart"]["bull_prob"][-1] == pytest.approx(reg["probs"][1], abs=1e-4)
+    assert reg["model_fit_end"] is None                         # no model, no model input to date
+    # a trained model keeps its stored, pre-evaluation HMM for the feature and names that fit's end
+    model, _ = ar_model
+    frames, nifty16 = panel(16, 1000, 0.15, seed=7)
+    res = q.predict(model, "S01", frames["S01"], nifty16)
+    assert res["regime"]["model_fit_end"] == q._date(model.hmm["S01"]["fit_end_ts"])
+    assert res["regime"]["model_fit_end"] <= model.evaluation["hmm_fit_end"] < res["regime"]["fit_end"]
+
+
 # ---------------------------------------------------------------------------- service
 class FakeLake:
     def __init__(self, frames):
@@ -251,7 +348,7 @@ class FakeData:
 
 
 HORIZON_KEYS = {"h", "label", "p_up", "exp_ret", "ret_sd", "range68", "range95", "price_median", "signal",
-                "confidence", "oos_auc", "oos_acc", "base_rate"}
+                "confidence", "oos_auc", "oos_acc", "base_rate", "edge", "edge_note", "flat"}
 INFO_KEYS = {"status", "progress", "message", "trained_at", "symbols", "rows", "features", "metrics"}
 METRIC_KEYS = {"h", "auc", "acc", "brier", "brier_base", "logloss", "logloss_base", "base_rate", "ic", "n_test",
                "folds"}
@@ -296,11 +393,15 @@ def test_service_result_shapes(tmp_path):
         assert set(c) == {"key", "label", "value", "display", "z", "reading", "tone"}
         assert c["tone"] in ("up", "down", "neutral") and math.isfinite(c["value"])
     assert {c["key"] for c in res["components"]} >= {"trend", "momentum", "regime", "vol_regime", "rsi"}
-    assert 0 < len(res["contributions"]) <= 10
-    assert set(res["contributions"][0]) == {"feature", "label", "value", "contribution"}
+    if res["contributions_flat"]:                              # 1-month spread shrunk to the base rate
+        assert res["contributions"] == [] and res["horizons"][-1]["flat"]
+    else:
+        assert 0 < len(res["contributions"]) <= 10
+        assert set(res["contributions"][0]) == {"feature", "label", "value", "contribution"}
     reg = res["regime"]
     assert reg["state"] in ("bull", "bear", "sideways") and sum(reg["probs"]) == pytest.approx(1, abs=1e-3)
     assert len(reg["mu_annual"]) == len(reg["vol_annual"]) == len(reg["expected_duration"]) == 2
+    assert reg["fit_start"] < reg["fit_end"] == res["asof"] and reg["model_fit_end"] < reg["fit_end"]
     assert set(res["vol"]) == {"garch_now", "garch_21d", "long_run", "ewma", "realized_21", "percentile"}
     assert 0 <= res["vol"]["percentile"] <= 1
     ch = res["chart"]
@@ -318,11 +419,35 @@ def test_service_result_shapes(tmp_path):
     assert short["horizons"] == [] and short["status"] == "ready"
     assert any("needs about" in w for w in short["warnings"])
 
-    assert board["h"] == 5 and set(board) >= {"h", "asof", "up", "down", "model"}
-    assert len(board["up"]) == len(board["down"]) == 3
-    assert set(board["up"][0]) == {"symbol", "sector", "close", "p_up", "exp_ret", "signal"}
-    assert board["up"][0]["p_up"] >= board["up"][-1]["p_up"] >= board["down"][0]["p_up"]
-    assert "SHORTY" not in [x["symbol"] for x in board["up"] + board["down"]]
+    assert board["h"] == 5 and set(board) >= {"h", "asof", "up", "down", "model", "edge", "edge_note", "flat"}
+    if board["flat"]:
+        assert board["up"] == board["down"] == [] and "no ranking" in board["edge_note"]
+    else:
+        assert len(board["up"]) == len(board["down"]) == 3
+        assert set(board["up"][0]) == {"symbol", "sector", "close", "p_up", "exp_ret", "signal"}
+        assert board["up"][0]["p_up"] >= board["up"][-1]["p_up"] >= board["down"][0]["p_up"]
+        assert "SHORTY" not in [x["symbol"] for x in board["up"] + board["down"]]
+
+
+def test_leaderboard_has_no_ranking_on_a_flat_horizon(ar_model, tmp_path):
+    model, _ = ar_model
+    frames, nifty = panel(16, 1000, 0.15, seed=7)
+    m = _with_spreads(model, h21=0.0)
+    m.trained_at = time.time()
+
+    async def run():
+        qs = q.QuantService(FakeData(frames, nifty), model_path=tmp_path / "m.json")
+        qs._model, qs._loaded = m, True                         # serve this model, no training
+        return await qs.leaderboard(21, 5), await qs.leaderboard(1, 5)
+
+    flat, ranked = asyncio.run(run())
+    # every stock has the same P(up): no "most likely up / down" lists ordered by the discarded raw score
+    assert flat["flat"] is True and flat["up"] == [] and flat["down"] == []
+    assert flat["edge"] is False and "no ranking" in flat["edge_note"]
+    assert flat["base_p"] == round(m.horizons[21].base, 4) and flat["asof"]
+    assert ranked["flat"] is False and len(ranked["up"]) == len(ranked["down"]) == 5
+    assert ranked["up"][0]["p_up"] > ranked["down"][0]["p_up"]
+    assert ranked["base_p"] == round(m.horizons[1].base, 4)
 
 
 def test_service_reports_training_failure(tmp_path):
