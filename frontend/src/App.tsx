@@ -14,6 +14,10 @@ const Swing = lazy(() => import("./desks/Swing"));
 const News = lazy(() => import("./desks/News"));
 const Alerts = lazy(() => import("./desks/Alerts"));
 const Geo = lazy(() => import("./desks/Geo"));
+const AiAnalyst = lazy(() => import("./desks/AiAnalyst"));
+const Screener = lazy(() => import("./desks/Screener"));
+const MonteCarlo = lazy(() => import("./desks/MonteCarlo"));
+const Quant = lazy(() => import("./desks/Quant"));
 
 const BASE_TOPICS = ["clock", "market", "top", "quotes", "geo:risk"];
 const DESK_TOPICS: Record<DeskId, string[]> = {
@@ -24,6 +28,10 @@ const DESK_TOPICS: Record<DeskId, string[]> = {
   news: ["news", "rank"],
   alerts: [],
   geo: [],          // the GEO desk subscribes per switched-on view
+  ai: [],           // research desks: REST only (daily history, fundamentals, models)
+  screener: [],
+  montecarlo: [],
+  quant: [],
 };
 
 export default function App() {
@@ -77,6 +85,10 @@ export default function App() {
             {desk === "news" && <News />}
             {desk === "alerts" && <Alerts />}
             {desk === "geo" && <Geo />}
+            {desk === "ai" && <AiAnalyst />}
+            {desk === "screener" && <Screener />}
+            {desk === "montecarlo" && <MonteCarlo />}
+            {desk === "quant" && <Quant />}
           </Suspense>
         </div>
       </main>

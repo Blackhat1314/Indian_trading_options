@@ -770,6 +770,12 @@ async def admin_backfill_coverage(who: User = Depends(admin)):
     return {"ok": True}
 
 
+# research desks (AI analyst, Screener, Monte Carlo, Quant): /api/research/... — before the SPA catch-all
+from .research_api import make_router  # noqa: E402
+
+app.include_router(make_router(current=current, admin=admin, csrf=_csrf))
+
+
 @app.get("/api/health")
 async def health():
     try:
