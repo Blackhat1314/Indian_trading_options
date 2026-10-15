@@ -698,3 +698,23 @@ fieldset.field { border: 0; margin: 0; padding: 0; min-width: 0; }
   .geo-legend { max-width: calc(100% - 16px); bottom: 34px; }
   .geo-presets button { padding: 3px 6px; }
 }
+
+/* ------------------------------------------------------------- admin SYSTEM · Dhan token panel */
+/* A full-width TOK row above the SYSTEM tab's grid (overrides .desk-system above). */
+.desk.desk-system { grid-template-rows: auto minmax(0, 1.1fr) minmax(0, 1fr); grid-template-areas: "tok tok" "sys score" "lake bt"; }
+.tok-panel { max-height: 46vh; }
+.tok-panel .panel-sub .chip { margin-right: 6px; vertical-align: 1px; }
+.facts.tok-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 24px; border-top: 0; }
+.facts.tok-facts span { flex-shrink: 0; }
+.facts.tok-facts b { display: block; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tok-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 2px 10px 8px; }
+.tok-form { padding: 0 10px 10px; max-width: 760px; }
+.tok-input-row { display: flex; gap: 6px; }
+.tok-input-row input { flex: 1; min-width: 0; }
+.tok-input-row .btn { height: 30px; }
+@media (max-width: 1180px) {
+  .desk.desk-system { grid-template-rows: auto !important; grid-template-areas: "tok" "sys" "score" "bt" "lake" !important; }
+  .desk > .panel.tok-panel { min-height: 0; max-height: none; }
+}
+@media (max-width: 900px) { .facts.tok-facts { grid-template-columns: minmax(0, 1fr); } }
+/* ------------------------------------------------------------- end Dhan token panel */

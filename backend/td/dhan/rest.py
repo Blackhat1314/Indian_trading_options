@@ -31,7 +31,7 @@ class DhanRest:
     def __init__(self, client_id: str | None = None, access_token: str | None = None, redis=None,
                  budget_file=None):
         self.client_id = client_id or settings.dhan_client_id
-        self.access_token = access_token or settings.dhan_access_token
+        self._token = access_token          # None: follow settings, where the token keeper swaps in renewed tokens
         self.base = settings.dhan_base_url.rstrip("/")
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0),
                                        limits=httpx.Limits(max_connections=10))
@@ -40,6 +40,10 @@ class DhanRest:
         self.chain_window = SlidingWindowUnique(settings.limit_chain_unique_per_8s, 8.0, 3.0)
         self.data_budget = DailyBudget("dhan_data", settings.limit_data_per_day, redis=redis, file=budget_file)
         self.calls = {"data": 0, "quote": 0, "chain": 0, "errors": 0}
+
+    @property
+    def access_token(self) -> str:
+        return self._token or settings.dhan_access_token
 
     async def close(self):
         await self._http.aclose()

@@ -28,6 +28,7 @@ from .. import __version__, bus
 from .. import backfill as bf
 from ..config import settings
 from ..dhan.rest import DhanRest
+from ..dhan.token import TokenKeeper
 from ..lake import Lake
 from ..ratelimit import DailyBudget
 from ..timeutil import IST, now_ist
@@ -86,6 +87,7 @@ class Backfiller:
         self._cov_at = 0.0
         self._uni: list | None = None
         self._rest: DhanRest | None = None
+        self._refused_token: str | None = None       # the token Dhan refused (a renewed one resumes the pull)
         self._usage: dict = {}
         self._calls_seen = 0
         self._bg: set[asyncio.Task] = set()
@@ -99,8 +101,10 @@ class Backfiller:
     def unavailable(self) -> str | None:
         if settings.data_source != "dhan":
             return "Simulator mode — history pulls need DATA_SOURCE=dhan (the simulator writes its own synthetic lake)."
-        if not (settings.dhan_client_id and settings.dhan_access_token):
-            return "DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN are not set in .env."
+        if not settings.dhan_client_id:
+            return "DHAN_CLIENT_ID is not set in .env."
+        if not settings.dhan_access_token:          # the token keeper's current token (renewed daily)
+            return "No Dhan access token — set DHAN_ACCESS_TOKEN in .env or paste one on /admin → SYSTEM."
         return None
 
     async def _idle(self, seconds: float) -> None:
@@ -401,8 +405,9 @@ class Backfiller:
             log.info("today's Dhan quota is used down to the reserve — resuming %s IST", _hm(self.resume_at))
         elif reason.startswith("auth"):
             self.resume_at = time.time() + 1800
-            log.error("Dhan rejected the credentials (%s) — paste a fresh DHAN_ACCESS_TOKEN into .env and restart; "
-                      "retrying in 30 min", reason[5:].strip())
+            self._refused_token = settings.dhan_access_token
+            log.error("Dhan rejected the credentials (%s) — renew or paste the token on /admin → SYSTEM; the pull "
+                      "resumes as soon as the token changes, else in 30 min", reason[5:].strip())
             self._set("error", f"Dhan credentials rejected: {reason[5:].strip()}")
         elif reason.startswith("disk"):
             job.active = False
@@ -433,15 +438,19 @@ class Backfiller:
             if self.state not in ("done", "stopped", "error"):
                 self._set("idle", "")
             await self._idle(30)
-        elif self.resume_at and time.time() < self.resume_at:
+        elif self.resume_at and time.time() < self.resume_at and not self._token_renewed():
             if self.state != "error":
                 self._set("waiting_quota", f"today's Dhan quota is used down to the reserve — resumes "
                                            f"{_hm(self.resume_at)} IST")
             await self._idle(min(60.0, self.resume_at - time.time()))
         else:
             self.resume_at = None
+            self._refused_token = None
             self.halt.clear()                    # a Stop / new settings from here on ends this pull
             await self._run(job)
+
+    def _token_renewed(self) -> bool:
+        return self._refused_token is not None and settings.dhan_access_token != self._refused_token
 
     async def _status(self) -> None:
         while not self.stop.is_set():
@@ -467,12 +476,15 @@ class Backfiller:
         log.info("backfill worker up (%s) — job: %s", settings.data_source,
                  "resuming" if self.job and self.job.active else "none")
         self._refresh_coverage(force=True)
+        keeper = TokenKeeper(self.r, role="follower")      # picks up the token the ingestor renews every day
+        await keeper.start()
         tasks = [asyncio.create_task(t) for t in (self._commands(), self._status(), self._main())]
         await self.stop.wait()
         self.halt.set()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await keeper.stop()
 
 
 async def main() -> None:
