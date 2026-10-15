@@ -112,7 +112,7 @@ class Settings(BaseSettings):
     ai_model: str = Field("", alias="AI_MODEL")           # default claude-opus-5-5 (anthropic); required for openai
     ai_base_url: str = Field("", alias="AI_BASE_URL")     # openai: default https://api.openai.com/v1
     ai_effort: str = Field("high", alias="AI_EFFORT")     # anthropic effort: low|medium|high|xhigh|max ("" = omit)
-    ai_max_tokens: int = Field(16000, alias="AI_MAX_TOKENS")
+    ai_max_tokens: int = Field(64000, alias="AI_MAX_TOKENS")   # thinking + the JSON report; streamed, so a cap only
     ai_timeout: float = Field(600, alias="AI_TIMEOUT")    # seconds per model call
     ai_daily_limit: int = Field(40, alias="AI_DAILY_LIMIT")   # AI analyses per day for the whole install
     ai_user_daily_limit: int = Field(10, alias="AI_USER_DAILY_LIMIT")   # per user (admins are exempt)

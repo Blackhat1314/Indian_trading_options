@@ -33,7 +33,7 @@ export interface McRequest {
 export interface McBand { t: number; ts: number; p5: number; p10: number; p25: number; p50: number; p75: number; p90: number; p95: number; mean: number }
 
 export interface McHorizon {
-  label: string;                 // "1M" "3M" "6M" "1Y" "2Y" "3Y" or "H" for the chosen horizon
+  label: string;                 // "1M" "3M" "6M" "1Y" "2Y" "3Y", or "<n>D" for a horizon that is not a checkpoint
   days: number; ts: number;
   p5: number; p25: number; p50: number; p75: number; p95: number; mean: number;
   prob_up: number;               // P(price at horizon > spot)
@@ -84,11 +84,11 @@ export interface McBacktestRequest { horizon_days: number; model: McModel; drift
 export interface McBacktest {
   symbol: string; model: McModel; drift: McDrift; horizon_days: number; origins: number; paths: number; elapsed_ms: number;
   coverage: { level: number; hit_rate: number; expected: number }[];   // central intervals 0.5 / 0.8 / 0.9
-  pit_hist: number[];            // 10 bins of the probability-integral transform (flat = calibrated)
+  pit_hist: number[];            // 10 bins of the probability-integral transform, fractions summing to 1 (flat 0.1 = calibrated)
   crps: number; crps_naive: number; skill: number;   // CRPS in % of spot; skill = 1 − crps / crps_naive
   direction_hit: number;         // share of origins where the simulated median got the direction right
   effective_n: number;           // non-overlapping windows (honest sample size)
-  points: { ts: number; spot: number; realized: number; p5: number; p50: number; p95: number }[];
+  points: { ts: number; target_ts: number; spot: number; realized: number; p5: number; p50: number; p95: number }[];   // ts = origin, target_ts = date of the realised price
   verdict: string;               // plain-language summary
   warnings: string[];
 }
@@ -105,6 +105,8 @@ export interface QuantHorizon {
   price_median: number;
   signal: Signal; confidence: Conf;
   oos_auc: number | null; oos_acc: number | null; base_rate: number | null;   // walk-forward, whole universe
+  edge: boolean;                 // the walk-forward verdict (AUC ≥ 0.52, 2 s.e. above 0.5, every fold ≥ 0.5, calibrated spread)
+  edge_note: string | null;      // why there is no / only a weak edge
 }
 
 export interface QuantComponent {
@@ -120,6 +122,9 @@ export interface QuantContribution { feature: string; label: string; value: numb
 export interface QuantMetric {
   h: number; auc: number; acc: number; brier: number; brier_base: number;
   logloss: number; logloss_base: number; base_rate: number; ic: number; n_test: number; folds: number;
+  fold_auc: (number | null)[]; auc_sd: number | null; auc_se: number | null; auc_pooled: number | null;   // auc = mean of folds
+  calib_b: number;               // calibration spread learnt walk-forward (0 = probabilities flattened to the base rate)
+  edge: boolean; edge_note: string | null;
 }
 
 export interface QuantModelInfo {
@@ -136,9 +141,10 @@ export interface QuantResult {
   components: QuantComponent[];
   contributions: QuantContribution[];
   regime: { state: "bull" | "bear" | "sideways"; labels: string[]; probs: number[]; mu_annual: number[]; vol_annual: number[]; expected_duration: number[] } | null;
-  vol: { garch_now: number; garch_21d: number; long_run: number; ewma: number; realized_21: number; percentile: number } | null;   // annualised
+  vol: { garch_now: number; garch_21d: number; long_run: number; ewma: number; realized_21: number; percentile: number } | null;   // annualised; percentile 0…1
   chart: {
-    ts: number[]; close: number[]; trend: number[]; upper: number[]; lower: number[]; bull_prob: number[];   // last ~1 year
+    ts: number[]; close: number[]; trend: number[]; upper: number[]; lower: number[]; bull_prob: number[];   // last ~1 year;
+    // upper/lower = trend channel (Kalman level ± 2 sd of price around it); bull_prob may be [] without an HMM
     forecast: { t: number; ts: number; p50: number; lo68: number; hi68: number; lo95: number; hi95: number }[];   // next 21 trading days
   } | null;
   stock_metrics: { h: number; auc: number | null; acc: number | null; n: number }[];   // walk-forward on this stock only
@@ -147,9 +153,10 @@ export interface QuantResult {
 }
 
 export interface QuantLeader { symbol: string; sector: string; close: number; p_up: number; exp_ret: number; signal: Signal }
-export interface QuantLeaderboard { h: number; asof: string; up: QuantLeader[]; down: QuantLeader[]; model: QuantModelInfo }
+export interface QuantLeaderboard { h: number; asof: string; up: QuantLeader[]; down: QuantLeader[]; model: QuantModelInfo; edge: boolean; edge_note: string | null }
 
 // ------------------------------------------------------------------ Screener fundamentals
+// Screener numbers keep Screener's units: percentages in percent (12.5 = 12.5 %), money in ₹ crore.
 export interface FinRow { label: string; values: (number | null)[]; is_pct: boolean }
 export interface FinTable { title: string; columns: string[]; rows: FinRow[]; unit: string }   // unit e.g. "Rs. Crores"
 

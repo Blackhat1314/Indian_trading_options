@@ -1,0 +1,96 @@
+/* QUANT desk. First screen (1366×768): picker, the three next-move cards, the trend chart and the regime panel;
+   the indicator table, contributions, leaderboard and model quality follow as the desk scrolls. */
+.desk-quant {
+  overflow-y: auto; align-content: start;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(340px, 0.9fr);
+  grid-template-rows: repeat(5, max-content);      /* a scrolling grid must not squeeze panels to the viewport */
+  grid-template-areas:
+    "pick  pick  pick"
+    "moves moves moves"
+    "chart chart regime"
+    "comp  comp  contrib"
+    "lead  lead  quality";
+}
+.desk-quant .warn { color: var(--amber); }
+@media (min-width: 1181px) {
+  .desk-quant > .qt-chart { min-height: clamp(340px, calc(100vh - 420px), 560px); }
+}
+.qt-pad { padding: 0 8px 8px; }
+.qt-pad:first-child { padding-top: 8px; }
+.qt-busy, .qt-cards.busy { opacity: .5; transition: opacity .2s; }
+.qt-h3 {
+  margin: 0; padding: 8px 10px 3px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+}
+.qt-lead { margin: 0; padding: 8px 10px; font-size: 12.5px; line-height: 1.45; color: var(--text-2); }
+.qt-lead b { color: var(--text); font-weight: 600; }
+.qt-note { margin: 0; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.qt-note b { font-weight: 600; }
+.qt-tbl tbody tr { cursor: default; }
+.qt-tbl td small { font-size: 10.5px; }
+.qt-read { white-space: normal !important; min-width: 80px; max-width: 190px; }
+.qt-wrap { white-space: normal !important; min-width: 180px; line-height: 1.35; color: var(--text-2); font-family: var(--font-ui) !important; font-size: 12px; }
+.qt-z { display: inline-flex; align-items: center; gap: 6px; }
+.qt-z .bar { width: 60px; min-width: 60px; }
+
+/* ------------------------------------------------------------ next-move cards */
+.qt-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+.qt-card {
+  display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r);
+}
+.qt-card.weak { border-color: rgba(245,165,36,.28); }
+.qt-card-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.qt-card-h { font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: .04em; margin-right: auto; }
+.qt-kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; margin: 0; }
+.qt-kv div { min-width: 0; }
+.qt-kv dt { font-family: var(--font-mono); font-size: 10px; color: var(--muted); letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+.qt-kv dd { margin: 0; font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.qt-kv dd small { font-weight: 400; font-size: 10.5px; }
+.qt-oos { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; line-height: 1.4; color: var(--text-2); padding-top: 5px; border-top: 1px solid var(--border); }
+.qt-oos .chip { align-self: flex-start; }
+.qt-oos b { color: var(--text); font-family: var(--font-mono); font-weight: 600; }
+.qt-noedge { margin: 0; font-size: 11.5px; line-height: 1.4; color: #fbd38d; background: rgba(245,165,36,.08); border: 1px solid rgba(245,165,36,.3); border-radius: var(--r); padding: 5px 7px; }
+
+/* ---------------------------------------------------------------- training */
+.qt-training { padding: 10px; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: var(--r); background: var(--bg-2); }
+.qt-training-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; }
+.qt-training p { margin: 0; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+.qt-training .bar.meter > i { left: 0; transition: width .4s; }
+.qt-pbar { display: inline-flex; align-items: center; gap: 6px; }
+.qt-pbar b { font-weight: 600; min-width: 34px; text-align: right; }
+.qt-pbar-track { position: relative; width: 70px; height: 6px; background: #18202c; border-radius: 1px; overflow: hidden; }
+.qt-pbar-track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--viz-3); border-radius: 0 2px 2px 0; }
+
+/* ------------------------------------------------------------ contributions */
+.qt-contrib { list-style: none; margin: 0; padding: 8px 10px 2px; display: flex; flex-direction: column; gap: 5px; }
+.qt-contrib li { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(60px, 1fr) auto 44px; align-items: center; gap: 8px; font-size: 12px; }
+.qt-c-label { color: var(--text-2); line-height: 1.25; }
+.qt-c-track { position: relative; height: 10px; background: #121924; border-radius: 2px; }
+.qt-c-track::after { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: #3b4a60; }
+.qt-c-track i { position: absolute; top: 0; bottom: 0; }
+.qt-c-track i.pos { left: 50%; background: var(--up); border-radius: 0 3px 3px 0; opacity: .85; }
+.qt-c-track i.neg { right: 50%; background: var(--down); border-radius: 3px 0 0 3px; opacity: .85; }
+.qt-c-val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; white-space: nowrap; }
+.qt-c-z { font-family: var(--font-mono); font-size: 10.5px; text-align: right; white-space: nowrap; }
+
+/* -------------------------------------------------------------- model + board */
+.qt-model-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 8px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--border); }
+.qt-model-line b { color: var(--text); font-family: var(--font-mono); font-weight: 600; }
+.qt-lead-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 8px; }
+.qt-lead-col { min-width: 0; }
+.qt-lead-col .tbl tbody tr { cursor: pointer; }
+.qt-lead-col .rc-prob-val { min-width: 36px; }
+.qt-metrics td:first-child { color: var(--text-2); font-family: var(--font-ui); }
+.qt-metrics td .chip { font-size: 10px; }
+
+@media (max-width: 1180px) {
+  .desk.desk-quant > .panel { min-height: 0; }
+  .desk.desk-quant > .qt-chart { min-height: 380px; }
+}
+@media (max-width: 900px) {
+  .qt-cards { grid-template-columns: minmax(0, 1fr); }
+  .qt-lead-grid { grid-template-columns: minmax(0, 1fr); }
+}
+/* z bars show how unusual a reading is, not its direction — the Lean column carries ▲▼ */
+.qt-z .bar.center > i.pos, .qt-z .bar.center > i.neg { background: var(--viz-1); }

@@ -1,0 +1,117 @@
+/* MONTE CARLO desk. The first screen (1366×768) holds the picker, the setup strip, the fan and the outcome / risk
+   column; tables, the distribution, the fitted inputs and the calibration backtest follow as the desk scrolls. */
+.desk-mc {
+  overflow-y: auto; align-content: start;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(340px, 0.9fr);
+  /* max-content rows: a scrolling grid must not squeeze panels to fit the viewport. The fan's own min-height sets
+     its row (most of the first screen); the row still grows when the outcome/risk column needs more. */
+  grid-template-rows: repeat(6, max-content);
+  grid-template-areas:
+    "pick  pick  pick"
+    "ctrl  ctrl  ctrl"
+    "fan   fan   side"
+    "horiz horiz targets"
+    "hist  hist  inputs"
+    "calib calib inputs";
+}
+.desk-mc .warn { color: var(--amber); }
+@media (min-width: 1181px) {
+  .desk-mc > .mc-fanp { min-height: clamp(380px, calc(100vh - 310px), 640px); }
+}
+.mc-side { min-height: 0; }
+.mc-side > .panel { flex: 1 1 auto; }
+.mc-side > .panel:first-child { flex: 0 1 auto; }
+.mc-runinfo { font-family: var(--font-mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* ------------------------------------------------------------ setup strip */
+.mc-ctrl { padding: 6px 8px; gap: 6px; }
+.mc-ctrl-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px 14px; }
+.mc-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mc-flabel { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+.mc-select {
+  height: 24px; background: #05080c; border: 1px solid var(--border-2); border-radius: var(--r);
+  padding: 0 6px; font-family: var(--font-mono); font-size: 11.5px; outline: none; max-width: 190px;
+}
+.mc-select:focus { border-color: var(--amber); }
+.mc-field-targets { flex: 1 1 260px; }
+.mc-targets { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-height: 24px; }
+.mc-tchip { height: 22px; gap: 5px; font-size: 11px; padding-right: 2px; }
+.mc-tchip small { font-size: 10px; font-weight: 500; }
+.mc-tchip button {
+  border: 0; background: transparent; color: var(--muted); width: 18px; height: 18px; padding: 0; border-radius: 2px;
+  font-size: 13px; line-height: 1;
+}
+.mc-tchip button:hover { color: var(--down); background: var(--hover); }
+.mc-tin { width: 128px; }
+.mc-tadd { height: 24px; padding: 0 8px; font-size: 10.5px; }
+.mc-help { margin: 0; font-size: 11.5px; line-height: 1.45; color: var(--text-2); }
+.mc-help b { color: var(--text); font-weight: 600; }
+.mc-ctrl .rs-error { padding: 2px 0; }
+
+/* ----------------------------------------------------------- text bits */
+.mc-lead { margin: 0; padding: 7px 10px; font-size: 12.5px; line-height: 1.45; color: var(--text-2); border-bottom: 1px solid var(--border); }
+.mc-lead b { color: var(--text); font-family: var(--font-mono); font-weight: 600; }
+.mc-note { margin: 0; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.mc-note b { color: var(--text-2); font-weight: 600; }
+.mc-pad { padding: 8px 10px 0; }
+.mc-range { font-size: 12px; }
+.mc-empty { padding: 12px 12px 14px; color: var(--text-2); font-size: 12px; line-height: 1.5; }
+.mc-empty p { margin: 0 0 8px; max-width: 760px; }
+.mc-verdict {
+  margin: 0; padding: 8px 10px; font-size: 13px; line-height: 1.45; color: var(--text);
+  border-left: 2px solid var(--viz-1); background: var(--bg-2);
+}
+
+/* ----------------------------------------------------------------- risk */
+.mc-risk { display: grid; grid-template-columns: minmax(0, 1fr) auto; margin: 0; }
+.mc-risk > div { display: contents; }
+.mc-risk dt, .mc-risk dd { padding: 5px 10px; border-bottom: 1px solid var(--border); }
+.mc-risk dt { font-size: 12px; color: var(--text-2); min-width: 0; }
+.mc-risk dt small { display: block; font-size: 11px; color: var(--muted); line-height: 1.3; }
+.mc-risk dd { margin: 0; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; text-align: right; white-space: nowrap; }
+.mc-risk dd .sep { color: var(--muted); font-weight: 400; margin: 0 4px; }
+
+/* --------------------------------------------------------------- tables */
+.mc-tbl tbody tr { cursor: default; }
+.mc-tbl td small { font-size: 10.5px; }
+.mc-tbl tr.mc-key td:first-child b { color: var(--amber); }
+.mc-tbl .rc-prob-val { min-width: 38px; }
+.mc-mini { font-size: 12px; }
+.mc-mini th, .mc-mini td { padding: 3px 6px; }
+.mc-pbar { display: inline-flex; align-items: center; gap: 6px; }
+.mc-pbar b { font-weight: 600; min-width: 34px; text-align: right; }
+.mc-pbar-track { position: relative; width: 64px; height: 6px; background: #18202c; border-radius: 1px; overflow: hidden; }
+.mc-pbar-track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--viz-1); border-radius: 0 2px 2px 0; }
+
+/* ---------------------------------------------------------- inputs used */
+.mc-inputs { display: flex; flex-direction: column; }
+.mc-inputs section { border-bottom: 1px solid var(--border); padding-bottom: 2px; }
+.mc-inputs h3, .mc-calib h3 {
+  margin: 0; padding: 7px 10px 3px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+}
+.mc-dl { display: grid; grid-template-columns: minmax(120px, auto) minmax(0, 1fr); gap: 2px 12px; margin: 0; padding: 2px 10px 4px; font-size: 12px; }
+.mc-dl dt { color: var(--text-2); white-space: nowrap; }
+.mc-dl dd { margin: 0; font-family: var(--font-mono); font-variant-numeric: tabular-nums; min-width: 0; overflow-wrap: anywhere; }
+.mc-dl dd .muted { font-family: var(--font-ui); font-size: 11px; margin-left: 4px; }
+.mc-inputs .rs-warnings { margin: 8px 10px; }
+
+/* ---------------------------------------------------------- calibration */
+.mc-bt-label { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); letter-spacing: .05em; text-transform: uppercase; margin-left: 4px; }
+.mc-bt-label:first-child { margin-left: 0; }
+.mc-calib { display: flex; flex-direction: column; gap: 4px; padding-bottom: 8px; transition: opacity .2s; }
+.mc-calib.busy { opacity: .5; }
+.mc-calib-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 16px; }
+.mc-calib .rc { padding: 0 10px; }
+.mc-calib .rs-warnings { margin: 4px 10px 0; }
+
+@media (max-width: 1180px) {
+  .desk.desk-mc > .panel, .desk.desk-mc > .stack { min-height: 0; }   /* content height; the fan keeps its plot's minimum */
+  .mc-calib-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .mc-ctrl-row { gap: 6px 10px; }
+  .mc-ctrl-row .seg { flex-wrap: wrap; }
+  .mc-tin { width: 110px; }
+  .mc-runinfo { display: none; }
+}
