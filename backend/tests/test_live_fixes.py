@@ -152,3 +152,17 @@ def test_missing_iv_filled():
     optmath.fill_missing_greeks([row], 22423.1, 2 / 365)
     assert row["ce_iv"] and 0.9 < row["ce_delta"] <= 1.0
     assert row["pe_iv"] is None and row["pe_delta"] == 0.0
+
+
+def test_breadth_without_prices_has_the_full_shape():
+    """Feed down / token expired: the MARKET desk reads every breadth field, so the no-prices record (n = 0) must
+    carry them all — a missing `hist` used to crash the desk and blank the whole terminal."""
+    from td.analytics.market import breadth
+    from td.analytics.state import InstState
+
+    s = InstState(1, "NSE_EQ", "AAA", "EQ", "AAA", "IT")
+    s.pc, s.ltp, s.high, s.low = 100.0, 101.0, 101.5, 99.5
+    live = breadth([s])
+    empty = breadth([InstState(2, "NSE_EQ", "BBB", "EQ", "BBB", "IT")])          # no ltp / pc yet
+    assert empty["n"] == 0 and set(empty) == set(live)
+    assert len(empty["hist"]) == len(empty["hist_bins"]) == len(live["hist"]) and not any(empty["hist"])

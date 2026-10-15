@@ -13,8 +13,18 @@ function BreadthPanel() {
   const m = useLive((s) => s.market);
   if (!m) return <Panel code="BRTH" title="Breadth" area="breadth"><Empty>Waiting…</Empty></Panel>;
   const b = m.breadth;
+  if (!b?.n) {
+    // n = 0: the analytics worker runs but no prices have come in (feed down, Dhan token expired, before the open)
+    return (
+      <Panel code="BRTH" title="Market breadth" area="breadth">
+        <Empty>No prices yet — breadth appears once the market feed delivers quotes (check the Dhan token and market hours).</Empty>
+      </Panel>
+    );
+  }
+  const hist = b.hist ?? [];
+  const bins = b.hist_bins ?? [];
   const total = Math.max(1, b.adv + b.dec + b.unch);
-  const maxH = Math.max(1, ...b.hist);
+  const maxH = Math.max(1, ...hist);
   return (
     <Panel code="BRTH" title="Market breadth" area="breadth" sub={`${b.n} F&O stocks · median ${pct(b.median_chg)}`}>
       <div className="kpis">
@@ -31,17 +41,17 @@ function BreadthPanel() {
           <i style={{ width: `${(b.unch / total) * 100}%`, background: "#3a4659" }} />
           <i style={{ width: `${(b.dec / total) * 100}%`, background: "var(--down)" }} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: `repeat(${b.hist.length}, 1fr)`, gap: 3, alignItems: "end", height: 70, marginTop: 10 }}
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${hist.length}, 1fr)`, gap: 3, alignItems: "end", height: 70, marginTop: 10 }}
           role="img" aria-label="Distribution of % change">
-          {b.hist.map((h, i) => (
-            <div key={i} title={`${b.hist_bins[i]}%: ${h} stocks`} style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%" }}>
+          {hist.map((h, i) => (
+            <div key={i} title={`${bins[i] ?? ""}%: ${h} stocks`} style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%" }}>
               <span className="tiny mono muted center">{h}</span>
               <div style={{ height: `${(h / maxH) * 52}px`, background: i < 5 ? "rgba(255,82,99,.65)" : "rgba(39,209,127,.65)", borderRadius: 1 }} />
             </div>
           ))}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: `repeat(${b.hist.length}, 1fr)`, gap: 3 }}>
-          {b.hist_bins.map((l) => <span key={l} className="tiny mono muted center">{l}</span>)}
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${hist.length}, 1fr)`, gap: 3 }}>
+          {bins.map((l) => <span key={l} className="tiny mono muted center">{l}</span>)}
         </div>
       </div>
     </Panel>
@@ -54,7 +64,7 @@ function Heatmap() {
   const setDesk = useLive((s) => s.setDesk);
   return (
     <Panel code="HEAT" title="Sector heatmap" area="heat" sub="tiles sized equally · colour = % change (text shows the value)">
-      {!m ? <Empty>Waiting…</Empty> : (
+      {!m ? <Empty>Waiting…</Empty> : !m.sectors?.length ? <Empty>No prices yet — sectors fill in once quotes arrive.</Empty> : (
         <div className="heat">
           {m.sectors.map((s) => (
             <div className="heat-sector" key={s.sector}>
@@ -89,7 +99,8 @@ function MoverTable({ title, rows, metric }: { title: string; rows: MoverRow[]; 
         <table className="tbl">
           <thead><tr><th className="l">Symbol</th><th>LTP</th><th>Chg</th><th>{metric === "turnover" ? "₹ Cr" : "RVOL"}</th></tr></thead>
           <tbody>
-            {rows.map((r) => (
+            {!rows?.length && <tr><td colSpan={4} className="muted center">No prices yet</td></tr>}
+            {(rows ?? []).map((r) => (
               <tr key={r.sid} onClick={() => { select(r.symbol); setDesk("intraday"); }}>
                 <td className="sym">{r.symbol}</td><td>{px(r.ltp)}</td><td className={cls(r.chg)}>{pct(r.chg)}</td>
                 <td className={metric === "rvol" && r.rvol >= 2 ? "amber" : ""}>{metric === "turnover" ? fx(r.turnover, 0) : `${fx(r.rvol, 1)}x`}</td>
