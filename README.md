@@ -383,6 +383,16 @@ Things to know:
   `backend/td/geo/sites.py`), and add calendar dates in `data/config/macro_calendar.json`.
 * `GEO_TO_NEWS=true` sends severity-3 signals to the NEWS desk, where they feed the ranker's catalyst factor.
   It's off by default.
+* A view showing ERROR or WAITING: hover its badge for the reason, then check every feed from the server itself with
+  `docker compose exec geo python -m td.geo.diagnose` (or `cd backend && python -m td.geo.diagnose`). It prints
+  one OK/FAIL line per source and never prints your keys. Feeds that work at home can be refused from cloud server
+  addresses. FRED is the usual one, and a free `FRED_API_KEY` fixes it. When adsb.lol rate-limits the server, the
+  air view keeps the aircraft it has and pauses for 30 s to 5 min instead of erroring.
+* Military aircraft load when someone opens the air view (the first batch within a few seconds, then every 2 min).
+  A ship's type (tanker, cargo…) arrives in a separate AIS report every 6 minutes, and shore receivers miss many
+  of them. So on a fresh install most ships start grey ("unknown") and get labelled over the first hours. The
+  worker keeps learning types even while nobody views ships (type reports only, a few a minute). Learnt types are
+  remembered in Redis for 14 days, so restarts keep them.
 
 ## How the intraday picks work
 

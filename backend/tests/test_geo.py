@@ -72,6 +72,13 @@ def test_ais_parsing():
     kind, d = sources.parse_ais(st)
     assert kind == "static" and sources.ship_class(d["type"]) == "TANKER"
     assert sources.parse_ais({"MessageType": "PositionReport", "MetaData": {}, "Message": {}}) is None
+    b = {"MessageType": "StaticDataReport", "MetaData": {"MMSI": 261005636, "ShipName": "SEA OTTER "},
+         "Message": {"StaticDataReport": {"UserID": 261005636, "ReportA": {"Valid": False},
+                                          "ReportB": {"Valid": True, "ShipType": 30}}}}
+    kind, d = sources.parse_ais(b)
+    assert kind == "static" and sources.ship_class(d["type"]) == "FISHING" and d["name"] == "SEA OTTER"
+    b["Message"]["StaticDataReport"]["ReportB"]["Valid"] = False          # name-only part A: nothing to learn
+    assert sources.parse_ais(b) is None
 
 
 def test_adsb_parsing():
@@ -149,3 +156,67 @@ def test_geo_sim_shapes():
     assert len(near) >= 7
     counts, base = sim.air_counts()
     assert counts[sim.closed_region] < min(base[sim.closed_region])
+
+
+def test_rate_limit_wait_backs_off_only_on_429():
+    import httpx
+
+    def err(code, headers=None):
+        req = httpx.Request("GET", "https://api.adsb.lol/v2/mil")
+        return httpx.HTTPStatusError("x", request=req, response=httpx.Response(code, headers=headers, request=req))
+
+    assert sources.rate_limit_wait(err(500)) is None
+    assert sources.rate_limit_wait(RuntimeError("boom")) is None
+    assert sources.rate_limit_wait(err(429)) == 30
+    assert sources.rate_limit_wait(err(429), strikes=2) == 120
+    assert sources.rate_limit_wait(err(429), strikes=9) == 300           # capped at 5 min
+    assert sources.rate_limit_wait(err(429, {"Retry-After": "90"})) == 90
+    assert sources.rate_limit_wait(err(429, {"Retry-After": "soon"})) == 30
+
+
+def test_fred_csv_retries_with_browser_agent_and_rejects_html():
+    import asyncio
+    from datetime import date
+
+    import httpx
+
+    seen = []
+
+    def handler(req):
+        seen.append(req.headers.get("user-agent", ""))
+        if "Mozilla" not in seen[-1]:
+            return httpx.Response(403, text="Forbidden")
+        return httpx.Response(200, text="observation_date,DCOILBRENTEU\n2026-10-14,70.5\n")
+
+    async def run(h):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+            return await sources.fred_fetch(c, "DCOILBRENTEU", date(2026, 10, 1))
+
+    assert asyncio.run(run(handler)) == [["2026-10-14", 70.5]] and len(seen) == 2
+    try:
+        asyncio.run(run(lambda req: httpx.Response(200, text="<html>Access denied</html>")))
+    except RuntimeError as e:
+        assert "instead of CSV" in str(e)
+    else:
+        raise AssertionError("an HTML page must not parse as an empty series")
+
+
+def test_air_loop_wakes_when_a_viewer_arrives():
+    import asyncio
+
+    from td.services.geo import GeoService
+
+    g = GeoService.__new__(GeoService)          # only the demand / stop state _nap reads
+    g.stop, g.demand = asyncio.Event(), {}
+
+    async def run():
+        async def viewer_opens_air():
+            await asyncio.sleep(0.1)
+            g.demand = {"geo:air": 1}
+        task = asyncio.create_task(viewer_opens_air())
+        t0 = time.monotonic()
+        await g._nap(60, "air")
+        await task
+        return time.monotonic() - t0
+
+    assert asyncio.run(run()) < 5

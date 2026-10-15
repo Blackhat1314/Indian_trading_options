@@ -25,8 +25,24 @@ log = logging.getLogger("td.geo.sources")
 UA = {"User-Agent": "TradeDesk/1.0 (personal market research; data only)"}
 
 
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/126.0 Safari/537.36"}
+
+
 def client(timeout: float = 30) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=timeout, headers=UA, follow_redirects=True)
+
+
+def rate_limit_wait(e: BaseException, strikes: int = 0) -> float | None:
+    """Seconds to pause when a feed answered 429 Too Many Requests (its Retry-After, else 30 s doubling per
+    repeat, at most 5 min); None for any other error."""
+    if not isinstance(e, httpx.HTTPStatusError) or e.response.status_code != 429:
+        return None
+    try:
+        hinted = float(e.response.headers.get("retry-after", ""))
+    except ValueError:
+        hinted = 0.0
+    return min(300.0, max(hinted, 30.0 * 2 ** min(strikes, 4)))
 
 
 # =========================================================================== GDELT
@@ -261,6 +277,12 @@ def parse_ais(msg: dict) -> tuple[str, dict] | None:
         return "static", {"mmsi": int(mmsi), "type": body.get("Type"), "name": (body.get("Name") or "").strip(),
                           "dest": (body.get("Destination") or "").strip(), "imo": body.get("ImoNumber"),
                           "draught": body.get("MaximumStaticDraught")}
+    if mtype == "StaticDataReport":                 # Class B (smaller craft): the type is in part B
+        rb = body.get("ReportB") or {}
+        if not rb.get("Valid") or not rb.get("ShipType"):
+            return None
+        return "static", {"mmsi": int(mmsi), "type": rb["ShipType"], "name": (meta.get("ShipName") or "").strip(),
+                          "dest": "", "imo": None, "draught": None}
     return None
 
 
@@ -432,8 +454,15 @@ async def fred_fetch(c: httpx.AsyncClient, sid: str, start: date, api_key: str =
         r.raise_for_status()
         return [[o["date"], round(float(o["value"]), 4)] for o in r.json().get("observations", [])
                 if o.get("value") not in (None, "", ".")]
-    r = await c.get(FRED_CSV.format(sid=sid, start=start.isoformat()))
+    url = FRED_CSV.format(sid=sid, start=start.isoformat())
+    r = await c.get(url)
+    if r.status_code in (403, 429):
+        # the CSV download refuses some cloud-server clients; a browser User-Agent usually gets through
+        # (a free FRED_API_KEY avoids the question entirely)
+        r = await c.get(url, headers=BROWSER_UA)
     r.raise_for_status()
+    if not r.text.lstrip().upper().startswith(("DATE", "OBSERVATION_DATE")):
+        raise RuntimeError("FRED returned a page instead of CSV data (blocked or rate-limited)")
     return parse_fred_csv(r.text)
 
 
