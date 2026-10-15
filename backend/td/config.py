@@ -103,6 +103,30 @@ class Settings(BaseSettings):
     session_days: float = Field(30, alias="SESSION_DAYS")            # login lasts this long
     session_secret: str = Field("", alias="SESSION_SECRET")          # default: data/auth/secret.key (generated)
 
+    # ---- research desks (AI analyst, Screener, Monte Carlo, Quant) ----------
+    # AI analyst: "anthropic" (Claude, official SDK) or "openai" = any OpenAI-compatible chat-completions API
+    # (OpenAI, OpenRouter, Groq, Together, DeepSeek, Gemini's OpenAI endpoint, a local Ollama/vLLM, ...).
+    # No key = the AI desk still shows the data dossier and a rule-based view, without the written analysis.
+    ai_provider: Literal["anthropic", "openai"] = Field("anthropic", alias="AI_PROVIDER")
+    ai_api_key: str = Field("", alias="AI_API_KEY")       # falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY
+    ai_model: str = Field("", alias="AI_MODEL")           # default claude-opus-5-5 (anthropic); required for openai
+    ai_base_url: str = Field("", alias="AI_BASE_URL")     # openai: default https://api.openai.com/v1
+    ai_effort: str = Field("high", alias="AI_EFFORT")     # anthropic effort: low|medium|high|xhigh|max ("" = omit)
+    ai_max_tokens: int = Field(64000, alias="AI_MAX_TOKENS")   # thinking + the JSON report; streamed, so a cap only
+    ai_timeout: float = Field(600, alias="AI_TIMEOUT")    # seconds per model call
+    ai_daily_limit: int = Field(40, alias="AI_DAILY_LIMIT")   # AI analyses per day for the whole install
+    ai_user_daily_limit: int = Field(10, alias="AI_USER_DAILY_LIMIT")   # per user (admins are exempt)
+    # Screener.in fundamentals: cached on disk, fetched politely (one page at a time, never search URLs)
+    screener_ttl_hours: float = Field(12, alias="SCREENER_TTL_HOURS")
+    screener_min_interval: float = Field(3.0, alias="SCREENER_MIN_INTERVAL")   # seconds between page fetches
+    # market assumptions for Monte Carlo drift (CAPM) — annual, decimal
+    risk_free_rate: float = Field(0.065, alias="RISK_FREE_RATE")       # ~India 10y G-sec
+    equity_risk_premium: float = Field(0.06, alias="EQUITY_RISK_PREMIUM")
+    # research desks top up missing daily history from Dhan only while more than max(this, the live app's own daily
+    # need: 2000 on Pro / 800 on Basic) calls are left, and at most research_fetch_per_day times a day
+    research_fetch_reserve: int = Field(500, alias="RESEARCH_FETCH_RESERVE")
+    research_fetch_per_day: int = Field(300, alias="RESEARCH_FETCH_PER_DAY")
+
     @property
     def lake_dir(self) -> Path:
         sub = "sim" if self.data_source == "sim" else "dhan"

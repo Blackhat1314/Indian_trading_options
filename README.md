@@ -16,6 +16,15 @@ F6 ALERTS    price / % / RVOL / VWAP / ORB / OI / news / top-list alerts · one-
 F7 GEO       world map: live ships, chokepoints & ports, war/conflict events, refinery fires, military aircraft,
              satellite imagery · geo-risk index · oil & supply · India macro · market impact — every view switchable
 
+research desks — any NSE stock, from daily history + fundamentals (not the live feed):
+F8 AI        analyst view for 6 months / 1 / 2 / 3 years from chart, fundamentals, quant model, Monte Carlo, market,
+             news · any AI model from .env (Claude by default, or any OpenAI-compatible API) · rule-based without one
+F9 SCREENER  Screener.in fundamentals: ratios, statements, growth, shareholding, peers · derived metrics · scorecard
+F10 MONTE CARLO  10 000+ simulated price paths (GARCH-t, bootstrap, jumps, regimes, ensemble) · fan chart ·
+             distribution · risk · target odds · calibration backtest that scores the bands against what happened
+Alt+Q QUANT  next-day / week / month probabilities from a walk-forward-tested model (Kalman trend, GARCH, HMM
+             regimes, momentum, mean reversion…) with its measured out-of-sample accuracy shown next to every number
+
 /admin       a separate page for admins (log in at /login):
   USERS      accounts (admin / viewer), passwords, who is online
   HISTORY    pull the 5-year history from Dhan into the lake · progress, quota, coverage per symbol
@@ -138,6 +147,55 @@ separate admin page (`/admin`): USERS, HISTORY and SYSTEM.
 * **Behind a reverse proxy or tunnel** (nginx, Caddy, Cloudflare Tunnel): forward `Host` (or set
   `X-Forwarded-Host`), `X-Forwarded-For` and `X-Forwarded-Proto`, and use `ADMIN_USER`/`ADMIN_PASSWORD` for the first
   admin. The setup screen is switched off for requests that come through a proxy.
+
+## Research desks: AI analyst, Screener, Monte Carlo, Quant
+
+Four desks for researching any NSE stock (type a name or symbol in the box at the top of each; all four follow
+the same stock). They work from the daily bars in the lake — the 5-year pull from **/admin → HISTORY** makes them
+much better — plus Screener.in pages and, for the written analysis, an AI model. A stock outside the lake is fetched
+from Dhan in one call (10 years of daily bars) when the token is valid, at most `RESEARCH_FETCH_PER_DAY` (300) times a
+day, and only while more calls are left than the live desks need for the rest of the day (2 000 on Pro, 800 on
+Basic, or `RESEARCH_FETCH_RESERVE` if higher).
+
+**Nothing here predicts prices with certainty, and the desks say so.** Every forecast is a probability range, and
+every model shows how good it has actually been on data it never saw.
+
+* **F8 AI ANALYST** — press *Analyse*. It assembles a dossier — price & technicals (returns, CAGR, volatility,
+  drawdowns, moving averages, RSI, 52-week range, support/resistance, beta and relative strength vs NIFTY),
+  fundamentals from Screener.in, the quant model, a Monte Carlo run with its calibration check, market context
+  (NIFTY trend, VIX, breadth, sectors) and recent news — and asks the AI model for a view for **6 months, 1, 2 and
+  3 years**: stance, confidence, bull / base / bear targets with probabilities, drivers, risks, catalysts and what
+  would change the view. Each base target is checked against the Monte Carlo 5–95 % band. The dossier the model saw
+  is shown underneath, so every claim can be traced to a number.
+  Configure the model in `.env`: `AI_PROVIDER=anthropic` (default, Claude via the official SDK, `AI_MODEL` defaults
+  to `claude-opus-5-5`) or `AI_PROVIDER=openai` with `AI_BASE_URL` for any OpenAI-compatible API (OpenAI,
+  OpenRouter, Groq, Together, DeepSeek, Gemini's OpenAI endpoint, a local Ollama). Without a key you still get the
+  full dossier and a rule-based view. Reports are cached per stock per day; `AI_DAILY_LIMIT` and
+  `AI_USER_DAILY_LIMIT` cap spend.
+* **F9 SCREENER** — the company's Screener.in page as data: top ratios, pros & cons, compounded growth, quarterly and
+  annual P&L, balance sheet, cash flow, ratios, shareholding and peers, plus derived metrics (CAGRs, margins,
+  ROE/ROCE, debt/equity, interest cover, free cash flow, cash conversion, PEG, promoter/FII/DII changes) and a
+  20-check scorecard (quality, growth, valuation, health, ownership) whose rules are printed next to each check.
+  Banks and NBFCs are judged on lender metrics. Pages are cached `SCREENER_TTL_HOURS` and fetched one at a time
+  (`SCREENER_MIN_INTERVAL` s apart); search URLs are never used. Screener's terms of use apply — personal research.
+* **F10 MONTE CARLO** — simulate 2 000–25 000 paths up to 3 years. Models: GARCH(1,1) with fat-tailed shocks
+  (volatility clusters and mean-reverts), block bootstrap of the stock's own returns, Merton jump-diffusion,
+  a 2-state regime-switching model, plain GBM, or an ensemble of the first four (default). Drift: CAPM
+  (risk-free + β × equity risk premium, default), shrunk historical mean, zero, or the quant model's 1-month view
+  (only when that model has a measured edge). Shows the fan chart, the distribution of the final price, the
+  6M/1Y/2Y/3Y percentiles, VaR/CVaR, drawdowns, the odds of touching your target prices, and every input it used.
+  **Calibration**: *Backtest this model* re-fits the model at up to 80 past dates using only data before each one
+  and counts how often the real price landed inside the 50/80/90 % bands — e.g. RELIANCE's 1-month 90 % bands held
+  92.5 % of the time over 40 past dates. It also reports the CRPS skill against a plain random walk and the
+  number of independent windows behind the verdict.
+* **Alt+Q QUANT** — a pooled logistic model across every stock in the lake, on 26 causal features (Kalman trend,
+  momentum, mean reversion, GARCH volatility, HMM regime, Hurst exponent, RSI, 52-week position, residual momentum
+  vs NIFTY…), tested walk-forward (expanding window, purge + embargo, calibrated on earlier folds only). It gives
+  P(up) for the next day, week and month, expected return, 68/95 % price ranges, a 21-day forecast cone, what is
+  driving the model, a leaderboard, and the model's out-of-sample AUC / hit rate / Brier per horizon. **A horizon
+  without a measured edge is labelled "no reliable edge" and its signal is held at NEUTRAL** — on the current
+  5-year lake that is the honest result for 1 day and 1 month (AUC ≈ 0.52), with only a weak edge at 1 week.
+  It retrains daily in the background (~1 minute); admins can retrain on demand.
 
 ## Admin page → HISTORY: pull the 5-year history
 
@@ -355,9 +413,10 @@ each day's close, so early moves mean-revert by construction.
 | Key | Action |
 |---|---|
 | `/` or `Ctrl+K` | command line |
-| `F1`…`F7` / `Alt+1`…`7` | switch desk |
-| `RELIANCE` ⏎ | load a symbol into chart and depth |
-| `TOP5` `MKT` `FNO` `SWING` `NEWS` `ALRT` `SYS` | open a desk |
+| `F1`…`F10` / `Alt+1`…`0` | switch desk |
+| `Alt+Q` | QUANT desk |
+| `RELIANCE` ⏎ | load a symbol into chart and depth (on a research desk: into that desk) |
+| `TOP5` `MKT` `FNO` `SWING` `NEWS` `ALRT` `GEO` `AI` `SCRN` `MC` `QUANT` | open a desk |
 | `CHAIN BANKNIFTY` | option chain for an underlying |
 | `HELP` | shortcuts |
 
@@ -373,9 +432,12 @@ backend/td/
   services/            ingestor.py · analytics.py · geo.py · gateway.py · recorder.py · bootstrap.py (auto history)
   geo/                 world-event sources (GDELT, FIRMS, AIS, ADS-B, PortWatch, GPR, FRED), simulator, risk/impact engine, sites
   analytics/           intraday ranker · option math · SMC · swing · news · market breadth · alerts
+  research/            research desks: tsmath (GARCH, Kalman, HMM, bootstrap…) · montecarlo · quant ·
+                       screener (Screener.in) · llm (Claude / OpenAI-compatible) · ai (the analyst) · data
   lake.py              Parquet lake (+ DuckDB coverage)
   ratelimit.py         token buckets, daily budget, option-chain window
-backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker, news, swing, lake, geo parsers & rules, live-mode regressions)
+backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker, news, swing, lake, geo parsers & rules, live-mode regressions,
+                       research maths, Monte Carlo calibration, quant causality, Screener parser, AI client & analyst, research API)
 backfill/backfill.py   5-year history tool
 research/              evaluate_intraday.py (walk-forward backtest + weight fitting)
 scripts/               mock_dhan.py (local fake Dhan for testing the live path) · dev.sh

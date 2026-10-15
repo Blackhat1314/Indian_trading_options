@@ -5,8 +5,8 @@ import type {
   AlertFire, ChainSnap, Clock, FnoSnap, Instrument, Market, NewsItem, RankSnap, SwingSnap, TopSnap,
 } from "./types";
 
-export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo";
-const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo"];
+export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant";
+const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant"];
 
 export interface Toast { id: number; kind: "alert" | "event"; title: string; body: string; ts: number }
 
@@ -21,6 +21,7 @@ export interface LiveState {
   source: string;
   desk: DeskId;
   selected: string;              // selected symbol (equity)
+  researchSymbol: string;        // the stock the research desks (AI, SCREENER, MONTE CARLO, QUANT) are on — any NSE stock
   chainName: string;
   universe: Instrument[];
   bySymbol: Record<string, Instrument>;
@@ -41,6 +42,7 @@ export interface LiveState {
   setDesk: (d: DeskId) => void;
   setMe: (m: Me) => void;
   select: (s: string) => void;
+  setResearchSymbol: (s: string) => void;
   setChain: (n: string) => void;
   setUniverse: (u: Instrument[]) => void;
   ingest: (topic: string, data: unknown, event?: boolean) => void;
@@ -61,6 +63,7 @@ export const useLive = create<LiveState>((set, get) => ({
   source: "",
   desk: DESK_IDS.includes(getPref("td.desk") as DeskId) ? (getPref("td.desk") as DeskId) : "intraday",  // SYSTEM moved to /admin
   selected: getPref("td.sel") || "",
+  researchSymbol: getPref("td.rsym") || getPref("td.sel") || "RELIANCE",
   chainName: getPref("td.chain") || "NIFTY",
   universe: [],
   bySymbol: {},
@@ -86,6 +89,10 @@ export const useLive = create<LiveState>((set, get) => ({
   select: (s) => {
     setPref("td.sel", s);
     set({ selected: s });
+  },
+  setResearchSymbol: (s) => {
+    setPref("td.rsym", s);
+    set({ researchSymbol: s });
   },
   setChain: (n) => {
     setPref("td.chain", n);

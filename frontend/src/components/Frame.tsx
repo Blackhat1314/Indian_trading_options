@@ -12,6 +12,11 @@ export const DESKS: { id: DeskId; key: string; label: string; cmd: string }[] = 
   { id: "news", key: "F5", label: "NEWS", cmd: "NEWS" },
   { id: "alerts", key: "F6", label: "ALERTS", cmd: "ALRT" },
   { id: "geo", key: "F7", label: "GEO", cmd: "GEO" },
+  // research desks: any NSE stock, daily history + fundamentals (not the live feed)
+  { id: "ai", key: "F8", label: "AI ANALYST", cmd: "AI" },
+  { id: "screener", key: "F9", label: "SCREENER", cmd: "SCRN" },
+  { id: "montecarlo", key: "F10", label: "MONTE CARLO", cmd: "MC" },
+  { id: "quant", key: "Alt+Q", label: "QUANT", cmd: "QUANT" },
 ];
 // SYSTEM and the history pulls live on the separate admin page (/admin), for admins only.
 
@@ -73,7 +78,8 @@ function CommandBar() {
         } else {
           select(inst.symbol);
           const d = useLive.getState().desk;
-          if (!["intraday", "swing"].includes(d)) setDesk("intraday");
+          if (["ai", "screener", "montecarlo", "quant"].includes(d)) useLive.getState().setResearchSymbol(inst.symbol);
+          else if (!["intraday", "swing"].includes(d)) setDesk("intraday");
         }
       }
     }
@@ -196,8 +202,13 @@ export function Tabs() {
   const unread = useLive((s) => s.unreadAlerts);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const idx = DESKS.findIndex((d) => d.key === e.key);
-      const alt = e.altKey && /^[1-9]$/.test(e.key) ? Number(e.key) - 1 : -1;
+      // F-keys, Alt+1…9 / Alt+0 (10th desk) and Alt+Q; e.code, because Alt+key types other characters on macOS
+      const t = e.target as HTMLElement | null;
+      const typing = !!t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA");
+      if (typing && !/^F\d+$/.test(e.key)) return;          // Alt+letter / Alt+digit type characters in fields
+      const idx = DESKS.findIndex((d) => d.key === e.key || (e.altKey && d.key === `Alt+${e.code.replace(/^Key/, "")}`));
+      const digit = /^Digit[0-9]$/.test(e.code) ? Number(e.code.slice(5)) : -1;
+      const alt = e.altKey && digit >= 0 ? (digit === 0 ? 9 : digit - 1) : -1;
       const i = idx >= 0 ? idx : alt;
       if (i >= 0 && i < DESKS.length) {
         e.preventDefault();
@@ -282,9 +293,10 @@ export function HelpModal() {
         </header>
         <dl className="help-grid">
           <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the command line</dd>
-          <dt><kbd>F1</kbd>…<kbd>F7</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>7</kbd></dt><dd>Switch desk</dd>
+          <dt><kbd>F1</kbd>…<kbd>F10</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>0</kbd></dt><dd>Switch desk</dd>
+          <dt><kbd>Alt</kbd>+<kbd>Q</kbd></dt><dd>QUANT desk</dd>
           <dt>RELIANCE <kbd>GO</kbd></dt><dd>Load a symbol in the chart & depth</dd>
-          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO</dt><dd>Open a desk</dd>
+          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO · AI · SCRN · MC · QUANT</dt><dd>Open a desk</dd>
           <dt>ADMIN (top right)</dt><dd>Users, history pulls and system health — admins only</dd>
           <dt>CHAIN BANKNIFTY</dt><dd>Option chain for an underlying</dd>
           <dt>Click a row</dt><dd>Select the stock everywhere</dd>
