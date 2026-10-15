@@ -32,6 +32,10 @@ CLS_CODE = {"TANKER": 1, "CARGO": 2, "PASSENGER": 3, "MILITARY": 4, "FISHING": 5
 K_FIREHIST = "td:geo:firehist"
 K_AIRBASE = "td:geo:airbase"
 K_RISKHIST = "td:geo:riskhist"
+K_AISSTATIC = "td:geo:aisstatic"      # mmsi -> ship type / name / destination, kept across restarts
+AIS_STATIC_TTL = 14 * 86400
+AIS_ALL = ["PositionReport", "StandardClassBPositionReport", "ShipStaticData", "StaticDataReport"]
+AIS_TYPES_ONLY = ["ShipStaticData", "StaticDataReport"]
 
 
 def _calendar(today: date) -> list[dict]:
@@ -132,6 +136,14 @@ class GeoService:
         except asyncio.TimeoutError:
             pass
 
+    async def _nap(self, s: float, topic: str):
+        """Sleep up to s seconds, but wake as soon as someone starts viewing `topic` (demand is re-read every 4 s)."""
+        was, end = self.wants(topic), time.monotonic() + s
+        while not self.stop.is_set() and time.monotonic() < end:
+            await self._sleep(min(2.0, end - time.monotonic()))
+            if not was and self.wants(topic):
+                return
+
     # ------------------------------------------------------------ sim mode
     async def _sim_loop(self):
         sim = self.sim
@@ -173,23 +185,36 @@ class GeoService:
             self._st("ships", "NEEDS KEY", detail="free key from aisstream.io → AISSTREAM_API_KEY")
             return
         import websockets
+        # a ship's type (tanker, cargo…) only arrives in its static report, every ~6 min: remember what we learnt
+        try:
+            for k, v in (await self.r.hgetall(K_AISSTATIC)).items():
+                self.static[int(k)] = json.loads(v)
+            log.info("AIS: %d known ship types loaded", len(self.static))
+        except Exception:
+            log.debug("AIS static cache unreadable", exc_info=True)
+        learnt: dict[int, dict] = {}
         backoff = 2
         while not self.stop.is_set():
-            if not self.wants("ships", "chokepoints"):
-                self._st("ships", "PAUSED", detail="no one is viewing ships — websocket closed")
-                await self._sleep(5)
-                continue
+            # Someone viewing: positions + types. No one viewing: types only (~15 messages a minute), so tankers are
+            # already labelled when the map opens instead of showing up grey for the first half hour.
+            full = self.wants("ships", "chokepoints")
+            if not full:
+                self._st("ships", "PAUSED", detail="no one is viewing ships — learning ship types in the background")
             try:
                 async with websockets.connect(sources.AIS_URL, max_size=2 ** 22, ping_interval=20) as ws:
                     await ws.send(json.dumps({"APIKey": settings.aisstream_api_key, "BoundingBoxes": AIS_BOXES,
-                                              "FilterMessageTypes": ["PositionReport", "ShipStaticData",
-                                                                     "StandardClassBPositionReport"]}))
-                    self._st("ships", "LIVE", detail="connected")
+                                              "FilterMessageTypes": AIS_ALL if full else AIS_TYPES_ONLY}))
+                    if full:
+                        self._st("ships", "LIVE", detail="connected")
                     backoff = 2
                     idle_since = None
                     last_prune = time.time()
-                    async for raw in ws:
-                        p = sources.parse_ais(json.loads(raw))
+                    while not self.stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), 5)
+                        except asyncio.TimeoutError:
+                            raw = None
+                        p = sources.parse_ais(json.loads(raw)) if raw else None
                         if p:
                             kind, d = p
                             if kind == "pos":
@@ -199,12 +224,27 @@ class GeoService:
                                 self.ships[d["mmsi"]] = d
                             else:
                                 self.static[d["mmsi"]] = d
+                                learnt[d["mmsi"]] = d
                                 if d["mmsi"] in self.ships:
                                     self.ships[d["mmsi"]].update(type=d["type"], cls=sources.ship_class(d["type"]),
-                                                                 dest=d["dest"])
+                                                                 dest=d["dest"] or self.ships[d["mmsi"]].get("dest", ""))
+                        if not full and self.wants("ships", "chokepoints"):
+                            break                                   # a viewer arrived: reconnect with positions
                         now = time.time()
                         if now - last_prune > 30:
                             last_prune = now
+                            if learnt:
+                                try:
+                                    await self.r.hset(K_AISSTATIC, mapping={str(m): json.dumps(v)
+                                                                            for m, v in learnt.items()})
+                                    await self.r.expire(K_AISSTATIC, AIS_STATIC_TTL)
+                                    learnt.clear()
+                                except Exception:
+                                    log.debug("AIS static cache write failed", exc_info=True)
+                            if not full:
+                                self._st("ships", "PAUSED", detail="no one is viewing ships — learning ship types in "
+                                                                   f"the background ({len(self.static)} known)")
+                                continue
                             for m in [m for m, s in self.ships.items() if now - s["ts"] > 1800]:
                                 del self.ships[m]
                             engine.update_transits(self.sites["chokepoints"], self.ships, self.transits, now)
@@ -213,11 +253,9 @@ class GeoService:
                             if not self.wants("ships", "chokepoints"):
                                 idle_since = idle_since or now
                                 if now - idle_since > 60:
-                                    break
+                                    break                           # back to types only
                             else:
                                 idle_since = None
-                        if self.stop.is_set():
-                            break
             except Exception as e:
                 self._st("ships", "ERROR", detail=str(e)[:160])
                 log.warning("AIS stream: %s", e)
@@ -326,13 +364,13 @@ class GeoService:
         regions = self.sites["air_regions"]
         base_raw = await self.r.hgetall(K_AIRBASE)
         base = {k.decode(): json.loads(v) for k, v in base_raw.items()}   # region -> {hour: [counts]}
-        i, last_mil = 0, 0.0
+        i, last_mil, strikes = 0, 0.0, 0
         async with sources.client(20) as c:
             while not self.stop.is_set():
                 viewing = self.wants("air")
                 try:
                     now = time.time()
-                    if viewing and now - last_mil > 60:
+                    if viewing and now - last_mil > 120:
                         js = await sources.adsb_get(c, settings.adsb_api_url, "/v2/mil")
                         mil = sources.parse_adsb(js, mil=True)
                         civ = [a for a in self.aircraft if not a["mil"]]
@@ -359,12 +397,22 @@ class GeoService:
                         self.aircraft += [a for a in acs if a["hex"] not in seen]
                         self.aircraft = self.aircraft[-3000:]
                     self.dirty.add("air")
+                    strikes = 0
                     self._st("air", "LIVE", detail="military + airspace watch" if viewing else
                              "airspace watch only (no one viewing aircraft)", n=len(self.aircraft))
                 except Exception as e:
+                    wait = sources.rate_limit_wait(e, strikes)
+                    if wait is not None:
+                        # adsb.lol asking us to slow down is not an outage: keep the aircraft we have, back off
+                        strikes += 1
+                        self._st("air", "LIVE", detail=f"adsb.lol rate limit — pausing {wait:.0f} s",
+                                 n=len(self.aircraft))
+                        log.info("adsb: rate limited, pausing %.0f s", wait)
+                        await self._sleep(wait)
+                        continue
                     self._st("air", "ERROR", detail=f"ADS-B: {str(e)[:140]}")
                     log.warning("adsb: %s", e)
-                await self._sleep(15 if viewing else 60)
+                await self._nap(30 if viewing else 60, "air")
 
     # ------------------------------------------------------------ live: slow series
     async def _portwatch_loop(self):
@@ -372,19 +420,22 @@ class GeoService:
             return
         async with sources.client(60) as c:
             while not self.stop.is_set():
-                ok = 0
-                for cp in self.sites["chokepoints"]:
+                ok, err, total = 0, "", len(self.sites["chokepoints"])
+                for n, cp in enumerate(self.sites["chokepoints"], 1):
                     try:
                         rows = await sources.portwatch_fetch(c, cp["portwatch"], 430)
                         self.portwatch[cp["id"]] = sources.transit_stats(rows)
                         ok += 1
                     except Exception as e:
+                        err = f"{type(e).__name__}: {str(e)[:100]}"
                         log.warning("portwatch %s: %s", cp["name"], e)
+                    if self.status.get("chokepoints", {}).get("state") == "WAITING":
+                        self._st("chokepoints", "WAITING", detail=f"loading PortWatch {n}/{total}")
                     await asyncio.sleep(1)
                 self.dirty.add("chokepoints")
                 self._st("chokepoints", "LIVE" if ok else "ERROR",
-                         detail=f"PortWatch transits for {ok}/{len(self.sites['chokepoints'])} chokepoints "
-                                "(published with a few days' lag)")
+                         detail=(f"PortWatch transits for {ok}/{total} chokepoints (published with a few days' lag)"
+                                 if ok else f"IMF PortWatch unreachable from this server — {err}"))
                 await self._sleep(6 * 3600 if ok else 900)
 
     async def _gpr_loop(self):
@@ -420,16 +471,20 @@ class GeoService:
             return
         async with sources.client(60) as c:
             while not self.stop.is_set():
-                ok = 0
+                ok, err = 0, ""
                 for sid in sources.FRED_SERIES:
                     try:
                         self.fred[sid] = await sources.fred_fetch(c, sid, date.today() - timedelta(days=400),
                                                                   settings.fred_api_key)
                         ok += 1
                     except Exception as e:
+                        err = f"{type(e).__name__}: {str(e)[:100]}"
                         log.warning("fred %s: %s", sid, e)
                 self.dirty.add("macro")
-                self._st("macro", "LIVE" if ok else "ERROR", detail=f"FRED {ok}/{len(sources.FRED_SERIES)} series")
+                hint = "" if settings.fred_api_key else " — a free FRED_API_KEY (fred.stlouisfed.org) usually fixes this"
+                self._st("macro", "LIVE" if ok else "ERROR",
+                         detail=(f"FRED {ok}/{len(sources.FRED_SERIES)} series" if ok
+                                 else f"FRED unreachable from this server ({err}){hint}"))
                 await self._sleep(6 * 3600 if ok else 900)
 
     async def _quotes_loop(self):
