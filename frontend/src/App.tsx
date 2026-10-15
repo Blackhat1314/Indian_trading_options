@@ -1,4 +1,5 @@
 import { Suspense, lazy, useEffect } from "react";
+import { DeskBoundary } from "./components/DeskBoundary";
 import { HelpModal, StatusBar, Tabs, Toasts, TopBar } from "./components/Frame";
 import { Empty } from "./components/ui";
 import { api, ApiError } from "./lib/api";
@@ -77,19 +78,21 @@ export default function App() {
         {conn === "closed" && <div className="banner warn" role="status">Disconnected from the gateway — reconnecting…</div>}
         {conn === "denied" && connError && <div className="banner warn" role="alert">{connError}</div>}
         <div style={{ flex: 1, minHeight: 0, display: "grid" }}>
-          <Suspense fallback={<Empty>Loading desk…</Empty>}>
-            {desk === "intraday" && <Intraday />}
-            {desk === "market" && <Market />}
-            {desk === "fno" && <Fno />}
-            {desk === "swing" && <Swing />}
-            {desk === "news" && <News />}
-            {desk === "alerts" && <Alerts />}
-            {desk === "geo" && <Geo />}
-            {desk === "ai" && <AiAnalyst />}
-            {desk === "screener" && <Screener />}
-            {desk === "montecarlo" && <MonteCarlo />}
-            {desk === "quant" && <Quant />}
-          </Suspense>
+          <DeskBoundary key={desk} desk={desk}>
+            <Suspense fallback={<Empty>Loading desk…</Empty>}>
+              {desk === "intraday" && <Intraday />}
+              {desk === "market" && <Market />}
+              {desk === "fno" && <Fno />}
+              {desk === "swing" && <Swing />}
+              {desk === "news" && <News />}
+              {desk === "alerts" && <Alerts />}
+              {desk === "geo" && <Geo />}
+              {desk === "ai" && <AiAnalyst />}
+              {desk === "screener" && <Screener />}
+              {desk === "montecarlo" && <MonteCarlo />}
+              {desk === "quant" && <Quant />}
+            </Suspense>
+          </DeskBoundary>
         </div>
       </main>
       <StatusBar />

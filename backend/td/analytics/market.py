@@ -8,10 +8,17 @@ from .intraday import buildup_tag
 from .state import InstState, safe
 
 
+HIST_EDGES = [-5, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5]
+HIST_BINS = ["<-3", "-3..-2", "-2..-1", "-1..-.5", "-.5..0", "0..+.5", "+.5..1", "1..2", "2..3", ">3"]
+
+
 def breadth(eqs: list[InstState]) -> dict:
     live = [s for s in eqs if s.ltp and s.pc]
     if not live:
-        return {"adv": 0, "dec": 0, "unch": 0, "above_vwap": 0, "n": 0}
+        # no prices yet (feed down, token expired, before the open): same shape, n = 0 says "no reading"
+        return {"n": 0, "adv": 0, "dec": 0, "unch": 0, "ad_ratio": 0.0, "above_vwap": 0, "above_vwap_pct": 0.0,
+                "near_high": 0, "near_low": 0, "above_pdh": 0, "below_pdl": 0, "up_turnover": 0.0,
+                "down_turnover": 0.0, "median_chg": 0.0, "hist": [0] * len(HIST_BINS), "hist_bins": HIST_BINS}
     chg = np.array([s.chg for s in live])
     adv = int((chg > 0.05).sum())
     dec = int((chg < -0.05).sum())
@@ -22,7 +29,7 @@ def breadth(eqs: list[InstState]) -> dict:
     below_pdl = int(sum(1 for s in live if s.ctx.pdl and s.ltp < s.ctx.pdl))
     up_turn = float(sum(s.turnover_cr for s in live if s.chg > 0))
     dn_turn = float(sum(s.turnover_cr for s in live if s.chg < 0))
-    hist = np.histogram(np.clip(chg, -5, 5), bins=[-5, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5])[0].tolist()
+    hist = np.histogram(np.clip(chg, -5, 5), bins=HIST_EDGES)[0].tolist()
     return {
         "n": len(live), "adv": adv, "dec": dec, "unch": len(live) - adv - dec,
         "ad_ratio": safe(adv / dec if dec else adv, 2),
@@ -30,7 +37,7 @@ def breadth(eqs: list[InstState]) -> dict:
         "near_high": near_high, "near_low": near_low, "above_pdh": above_pdh, "below_pdl": below_pdl,
         "up_turnover": safe(up_turn, 1), "down_turnover": safe(dn_turn, 1),
         "median_chg": safe(float(np.median(chg))), "hist": hist,
-        "hist_bins": ["<-3", "-3..-2", "-2..-1", "-1..-.5", "-.5..0", "0..+.5", "+.5..1", "1..2", "2..3", ">3"],
+        "hist_bins": HIST_BINS,
     }
 
 
