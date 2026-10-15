@@ -28,7 +28,8 @@ Alt+Q QUANT  next-day / week / month probabilities from a walk-forward-tested mo
 /admin       a separate page for admins (log in at /login):
   USERS      accounts (admin / viewer), passwords, who is online
   HISTORY    pull the 5-year history from Dhan into the lake · progress, quota, coverage per symbol
-  SYSTEM     health of every service · the ranker's own scorecard · walk-forward backtest · data-lake coverage
+  SYSTEM     Dhan token (expiry, auto-renewal, renew / paste) · health of every service · the ranker's own
+             scorecard · walk-forward backtest · data-lake coverage
 ```
 
 It runs out of the box on a built-in **simulator** that emits byte-identical Dhan packets, so you can
@@ -91,13 +92,16 @@ For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173
 ## Going live with Dhan
 
 1. **Get API access**: on web.dhan.co, open your profile's DhanHQ API section, subscribe to a data plan
-   and generate an access token. Note its validity.
+   and generate an access token. It lasts 24 hours; from then on TradeDesk renews it by itself (below).
 2. **Configure** `.env`:
    ```
    DATA_SOURCE=dhan
    DHAN_CLIENT_ID=1000000001
    DHAN_ACCESS_TOKEN=eyJ...
    DHAN_PLAN=pro            # or basic for the ₹499 plan
+   # optional, for recovery after downtime (see "Dhan token" below):
+   # DHAN_PIN=1234
+   # DHAN_TOTP_SECRET=JBSWY3DPEHPK3PXP
    ```
 3. **Start the stack** (`docker compose up -d --build` or `python run.py --live`), ideally before 09:15 IST.
 4. **History loads itself** (`AUTO_HISTORY=true`, the default). Dhan's live feed sends a previous close
@@ -113,8 +117,8 @@ For frontend hot-reload during development use `./scripts/dev.sh` (Vite on :5173
    on the admin page's SYSTEM tab (**Auto history**). If you start after 09:30 that day's picks can't be locked
    on time, so the Intraday desk shows a live ranking marked *provisional* and the day isn't scored.
 5. **Optional, for research**: the full 5-year archive for the walk-forward backtest — open
-   **/admin → HISTORY** and press **Start pull** (below). When the token expires (Dhan shows the validity when you generate it), paste a
-   fresh one into `.env` and restart the ingestor: `docker compose restart ingestor`.
+   **/admin → HISTORY** and press **Start pull** (below). The pull follows the daily token renewal; a pull stopped by
+   a rejected token resumes as soon as a new one is in place.
 
 **Test the live path without an account or market hours**: `scripts/mock_dhan.py` is a local stand-in
 for Dhan (scrip master, both websockets, historical / intraday / option-chain REST) with Dhan's quirks:
@@ -123,6 +127,41 @@ strikes. The run commands are in the script's docstring.
 
 Rate limits are enforced in code: 5 data calls/s, 7,000/day (a budget shared through Redis between
 the live system and the backfill), quotes 1/s, option chains 1 per 3 s per underlying and expiry.
+
+---
+
+## Dhan token: daily expiry and automatic renewal
+
+Access tokens from Dhan Web expire 24 hours after they are generated. TradeDesk keeps its token alive, so a
+running deployment never needs a daily paste:
+
+* **Renewed every day.** While the token is valid the ingestor swaps it for a fresh 24-hour one with Dhan's
+  RenewToken call: in the 45-minute window from `DHAN_TOKEN_RENEW_AT` (08:30 IST, before the market opens) or,
+  at the latest, 2 hours before it expires, weekends included. A renewal lasts until the same time the next day,
+  so renewals land about once a day, outside market hours. Each new token is checked with Dhan (`/profile`,
+  same client id, no data-API quota) before it is used; a refused one leaves the old token in place.
+* **Every service follows.** The current token lives in Redis and in `data/auth/dhan_token.json` (file mode 0600,
+  because Docker's Redis keeps nothing across restarts). The gateway, the backfill worker, `backfill/backfill.py`
+  and the ingestor's REST calls pick up a new token within 30 s, and the websockets reconnect with it within
+  seconds. On start-up the token with the latest expiry wins, so an old `DHAN_ACCESS_TOKEN` left in the
+  environment no longer hides a newer one.
+* **After downtime.** Dhan renews only a token that is still valid. If the server was off long enough for it to
+  lapse, paste a new one on **/admin → SYSTEM → DHAN TOKEN** (no restart needed), or let the app log in by itself:
+  enable TOTP on Dhan Web (DhanHQ Trading APIs → Setup TOTP), then put your Dhan PIN in `DHAN_PIN` and the text
+  under the QR code in `DHAN_TOTP_SECRET`. **These two give full access to your Dhan account: keep them only in
+  `.env` on the server, never in git or anywhere else.** If Dhan refuses them twice in a row, automatic login
+  pauses (repeated wrong PINs can lock the account) until you fix them and restart the ingestor or press
+  **Renew now**.
+* **The DHAN TOKEN panel** at the top of /admin → SYSTEM (`F3`) shows the status (valid, expiring soon, expired,
+  missing), the expiry with a countdown, where the token came from (`.env`, auto-renewed, TOTP, pasted), the next
+  renewal, the data plan from Dhan's last check and the last error, with **Renew now** and **Paste new token**.
+  The token itself is never shown, logged or returned by the API (`GET /api/admin/dhan-token`, admins only).
+
+| `.env` | default | |
+|---|---|---|
+| `DHAN_TOKEN_AUTO_RENEW` | `true` | `false`: no renewals, replace the token by hand every day |
+| `DHAN_TOKEN_RENEW_AT` | `08:30` | start of the daily renewal window (IST) |
+| `DHAN_PIN`, `DHAN_TOTP_SECRET` | empty | both set: a new token is generated by itself once the old one has lapsed |
 
 ---
 
@@ -235,6 +274,8 @@ python backfill/backfill.py status                                   # coverage 
 python backfill/backfill.py sim                                      # synthetic lake for the simulator
 ```
 
+It uses the token the ingestor keeps renewed (Redis, else `data/auth/dhan_token.json`), not the one in `.env`,
+so a daily cron run keeps working after the first day.
 5- and 15-minute bars are resampled from 1-minute bars on the fly, so `D,1` is all you need.
 Daily bars take one request per symbol (Dhan returns 10+ years at once); 1-minute bars 90 days per request.
 `--rate` (default 3/s) and `--reserve` (default 800 calls) keep room for the live system.
@@ -419,6 +460,7 @@ each day's close, so early moves mean-revert by construction.
 | `TOP5` `MKT` `FNO` `SWING` `NEWS` `ALRT` `GEO` `AI` `SCRN` `MC` `QUANT` | open a desk |
 | `CHAIN BANKNIFTY` | option chain for an underlying |
 | `HELP` | shortcuts |
+| `F1` `F2` `F3` / `Alt+1`…`3` on /admin | USERS · HISTORY · SYSTEM (Dhan token, services, scorecard) |
 
 ---
 
@@ -427,7 +469,8 @@ each day's close, so early moves mean-revert by construction.
 ```
 backend/td/
   config.py            settings (.env)
-  dhan/                REST client, websocket feeds (sharded), binary packet parser, instruments
+  dhan/                REST client, websocket feeds (sharded), binary packet parser, instruments,
+                       token keeper (daily access-token renewal)
   sim/simulator.py     market simulator (Dhan-identical packets) + synthetic history
   services/            ingestor.py · analytics.py · geo.py · gateway.py · recorder.py · bootstrap.py (auto history)
   geo/                 world-event sources (GDELT, FIRMS, AIS, ADS-B, PortWatch, GPR, FRED), simulator, risk/impact engine, sites
@@ -437,6 +480,7 @@ backend/td/
   lake.py              Parquet lake (+ DuckDB coverage)
   ratelimit.py         token buckets, daily budget, option-chain window
 backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker, news, swing, lake, geo parsers & rules, live-mode regressions,
+                       Dhan token keeper (renewal, TOTP, followers, admin API),
                        research maths, Monte Carlo calibration, quant causality, Screener parser, AI client & analyst, research API)
 backfill/backfill.py   5-year history tool
 research/              evaluate_intraday.py (walk-forward backtest + weight fitting)
@@ -455,7 +499,8 @@ Tests: `cd backend && python -m pytest -q`
 * **Blank desks / "Waiting…"**: check /admin → SYSTEM. INGESTOR and ANALYTICS should show UP.
   `docker compose logs -f ingestor analytics`.
 * **Dhan errors 806–810**: 806 data plan not active, 807 token expired, 808/809 authentication or invalid
-  token, 810 wrong client ID. Usually a fresh token fixes it.
+  token, 810 wrong client ID. Open /admin → SYSTEM → DHAN TOKEN: **Renew now** while the token is still valid,
+  otherwise **Paste new token** (or set `DHAN_PIN` + `DHAN_TOTP_SECRET`, see "Dhan token" above).
 * **"Daily data-API budget exhausted"**: the backfill and the live system share the 7,000/day budget.
   Run large backfills with `--reserve 1500` on trading days, or on weekends.
 * **Ranking empty, breadth covers 2 stocks, NIFTY/BANKNIFTY missing from the top bar, F&O build-up

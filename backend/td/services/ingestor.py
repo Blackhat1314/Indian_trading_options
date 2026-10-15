@@ -184,9 +184,19 @@ async def run_sim(r, universe: Universe, pub: Publisher, stop: asyncio.Event) ->
 async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -> None:
     from ..dhan.feeds import CasFeed, Depth20Feed, MarketFeedManager, Sub
     from ..dhan.rest import DhanError, DhanRest
+    from ..dhan.token import TokenKeeper
     from ..ratelimit import BudgetExhausted
 
+    # owns the 24 h access token: renews it every day and, with DHAN_PIN + DHAN_TOTP_SECRET, logs in again after a
+    # lapse; the REST client and the feeds read the current token on every call / connect
+    keeper = TokenKeeper(r, role="owner")
+    await keeper.start()
     rest = DhanRest(redis=r)
+
+    def refused(e: DhanError) -> None:
+        if e.status in (401, 403) or str(e.code) in ("807", "808", "809", "DH-901"):
+            keeper.kick()
+
     subs: list[Sub] = []
     for i in universe.instruments:
         mode = {"IDX": C.REQ_SUB_TICKER, "EQ": C.REQ_SUB_QUOTE, "FUT": C.REQ_SUB_FULL}.get(i.kind, C.REQ_SUB_QUOTE)
@@ -276,6 +286,7 @@ async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -
                                  maxlen=2000, approximate=True)
                     pub.stats["chains"] += 1
                 except DhanError as e:
+                    refused(e)
                     log.warning("chain %s: %s", name, e)
             await asyncio.sleep(15)
 
@@ -303,6 +314,7 @@ async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -
                 if out:
                     await pub.news(out)
             except DhanError as e:
+                refused(e)
                 log.warning("news: %s", e)
             except BudgetExhausted as e:
                 # out of today's data calls: pause news (a crash here would take the whole ingestor down)
@@ -320,7 +332,7 @@ async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -
                 "feed": {"connected": feed.stats.connected, "reconnects": feed.stats.reconnects,
                          "messages": feed.stats.messages, "last_error": feed.stats.last_error},
                 "rest_calls": rest.calls, "data_budget_used": await rest.data_budget.used(),
-                "data_budget_limit": settings.limit_data_per_day,
+                "data_budget_limit": settings.limit_data_per_day, "token": keeper.brief(),
                 "recorder_rows": pub.recorder.rows_written, "updated": time.time(),
             }), ex=30)
             await asyncio.sleep(2)
@@ -329,6 +341,7 @@ async def run_dhan(r, universe: Universe, pub: Publisher, stop: asyncio.Event) -
         await asyncio.gather(feed.run(), flusher(), depth_mgr(), cas_mgr(), chain_poller(), news_poller(), status(),
                              history.run(stop))
     finally:
+        await keeper.stop()
         await rest.close()
 
 

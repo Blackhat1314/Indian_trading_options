@@ -34,6 +34,7 @@ from ..backfill import JobSpec
 from ..analytics import alerts as alerts_mod
 from ..analytics import smc
 from ..config import ROOT, settings
+from ..dhan.token import TokenError, TokenKeeper
 from ..lake import Lake
 from ..timeutil import IST, MARKET_OPEN, at, from_epoch
 
@@ -132,8 +133,12 @@ async def lifespan(app: FastAPI):
     await hub.start()
     app.state.redis = bus.connect()
     app.state.lake = Lake()
+    # follows the token the ingestor renews (research top-ups call Dhan from here) and serves the admin endpoints
+    app.state.dhan_token = TokenKeeper(app.state.redis, role="follower")
+    await app.state.dhan_token.start()
     asyncio.create_task(_status_loop(app))
     yield
+    await app.state.dhan_token.stop()
     await hub.stop()
     await app.state.redis.aclose()
 
@@ -768,6 +773,42 @@ async def admin_backfill_stop(who: User = Depends(admin)):
 async def admin_backfill_coverage(who: User = Depends(admin)):
     await _admin_cmd("coverage", who.name)
     return {"ok": True}
+
+
+# ------------------------------------------------------------- Dhan token
+@app.get("/api/admin/dhan-token")
+async def admin_dhan_token(who: User = Depends(admin)):
+    """Access-token status for /admin → SYSTEM: expiry, source, next renewal, last check. Never the token."""
+    return await app.state.dhan_token.snapshot()
+
+
+@app.post("/api/admin/dhan-token")
+async def admin_dhan_token_set(request: Request, who: User = Depends(admin)):
+    """Paste a new token: checked with Dhan (/profile, same client id), then every process switches to it.
+    The body is read by hand so a validation error can never echo the token back."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get("token"), str):
+        raise HTTPException(400, 'send JSON {"token": "<access token>"}')
+    try:
+        status = await app.state.dhan_token.adopt(body["token"])
+    except TokenError as e:
+        raise HTTPException(e.status, str(e)) from None
+    log.info("Dhan token replaced by admin %s", who.name)
+    return status
+
+
+@app.post("/api/admin/dhan-token/renew")
+async def admin_dhan_token_renew(who: User = Depends(admin)):
+    """Renew now (or, once the token has lapsed, log in with DHAN_PIN + DHAN_TOTP_SECRET when set)."""
+    try:
+        status = await app.state.dhan_token.renew_now()
+    except TokenError as e:
+        raise HTTPException(e.status, str(e)) from None
+    log.info("Dhan token renewed by admin %s", who.name)
+    return status
 
 
 # research desks (AI analyst, Screener, Monte Carlo, Quant): /api/research/... — before the SPA catch-all

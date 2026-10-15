@@ -2,11 +2,14 @@
 
 One `MarketFeedManager` shards the subscription list across up to 5 connections
 (5,000 instruments each, 100 per subscribe message) and reconnects with backoff.
-Parsed packets are handed to an async callback in batches.
+Parsed packets are handed to an async callback in batches. The URL (it carries the access token)
+is built on every connect, and an open socket is closed when the token keeper swaps the token, so the
+feeds move to a renewed token within seconds.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -23,6 +26,12 @@ from .parser import parse_cas, parse_depth, parse_market_feed
 log = logging.getLogger("td.dhan.feed")
 
 PacketHandler = Callable[[list[dict]], Awaitable[None]]
+TOKEN_POLL = 5.0          # s, how often an open socket checks whether the access token changed
+
+
+def _auth_url(base: str, version: bool = False) -> str:
+    v = "version=2&" if version else ""
+    return f"{base}?{v}token={settings.dhan_access_token}&clientId={settings.dhan_client_id}&authType=2"
 
 
 @dataclass
@@ -42,6 +51,10 @@ class FeedStats:
     per_conn: dict = field(default_factory=dict)
 
 
+def _scrub(text: str, token: str) -> str:
+    return text.replace(token, "***") if token else text
+
+
 def _sub_messages(subs: list[Sub]) -> list[str]:
     msgs = []
     by_mode: dict[int, list[Sub]] = {}
@@ -59,22 +72,38 @@ def _sub_messages(subs: list[Sub]) -> list[str]:
 
 
 class _Conn:
-    def __init__(self, idx: int, url: str, subs: list[Sub], handler: PacketHandler, stats: FeedStats,
-                 parser=parse_market_feed):
+    def __init__(self, idx: int, url: str | Callable[[], str], subs: list[Sub], handler: PacketHandler,
+                 stats: FeedStats, parser=parse_market_feed):
         self.idx = idx
-        self.url = url
+        self.url = url              # a factory: called on every (re)connect, so a renewed token is used
         self.subs = subs
         self.handler = handler
         self.stats = stats
         self.parser = parser
         self._stop = asyncio.Event()
+        self._rotated = False
+
+    async def _watch_token(self, ws, used: str) -> None:
+        while True:
+            await asyncio.sleep(TOKEN_POLL)
+            if settings.dhan_access_token != used:
+                log.info("feed[%d] access token renewed — reconnecting", self.idx)
+                self._rotated = True
+                with contextlib.suppress(Exception):
+                    await ws.close(code=1000, reason="token renewed")
+                return
 
     async def run(self):
         backoff = 1.0
         while not self._stop.is_set():
+            used = settings.dhan_access_token
+            url = self.url() if callable(self.url) else self.url
+            watch: asyncio.Task | None = None
             try:
-                async with connect(self.url, max_size=2 ** 22, ping_interval=None,
+                async with connect(url, max_size=2 ** 22, ping_interval=None,
                                    open_timeout=15, close_timeout=5) as ws:
+                    if callable(self.url):
+                        watch = asyncio.create_task(self._watch_token(ws, used))
                     self.stats.connected += 1
                     self.stats.per_conn[self.idx] = "up"
                     for msg in _sub_messages(self.subs):
@@ -94,17 +123,26 @@ class _Conn:
                                     log.warning("feed[%d] %s", self.idx, self.stats.last_error)
                             await self.handler(pkts)
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                self.stats.last_error = f"conn {self.idx}: {type(e).__name__}: {e}"
+                self.stats.last_error = f"conn {self.idx}: {type(e).__name__}: {_scrub(str(e), used)}"
             except Exception as e:  # pragma: no cover - defensive
-                self.stats.last_error = f"conn {self.idx}: {type(e).__name__}: {e}"
-                log.exception("feed[%d] error", self.idx)
+                self.stats.last_error = f"conn {self.idx}: {type(e).__name__}: {_scrub(str(e), used)}"
+                if used and used in str(e):              # e.g. an invalid-URI error quoting the URL
+                    log.error("feed[%d] error: %s", self.idx, self.stats.last_error)
+                else:
+                    log.exception("feed[%d] error", self.idx)
             finally:
+                if watch:
+                    watch.cancel()
                 if self.stats.per_conn.get(self.idx) == "up":
                     self.stats.connected = max(0, self.stats.connected - 1)
                 self.stats.per_conn[self.idx] = "down"
             if self._stop.is_set():
                 break
             self.stats.reconnects += 1
+            if self._rotated:                            # not a failure: reconnect at once with the new token
+                self._rotated = False
+                backoff = 1.0
+                continue
             await asyncio.sleep(backoff + random.random())
             backoff = min(backoff * 2, 30)
 
@@ -124,8 +162,7 @@ class MarketFeedManager:
         self._conns: list[_Conn] = []
 
     def _url(self) -> str:
-        return (f"{settings.dhan_feed_url}?version=2&token={settings.dhan_access_token}"
-                f"&clientId={settings.dhan_client_id}&authType=2")
+        return _auth_url(settings.dhan_feed_url, version=True)
 
     async def run(self):
         per = C.MAX_INSTRUMENTS_PER_CONNECTION
@@ -133,7 +170,7 @@ class MarketFeedManager:
         dropped = len(self.subs) - sum(len(s) for s in shards)
         if dropped > 0:
             log.warning("feed: %d instruments exceed websocket capacity and were dropped", dropped)
-        self._conns = [_Conn(i, self._url(), shard, self.handler, self.stats) for i, shard in enumerate(shards)]
+        self._conns = [_Conn(i, self._url, shard, self.handler, self.stats) for i, shard in enumerate(shards)]
         await asyncio.gather(*(c.run() for c in self._conns))
 
     def stop(self):
@@ -149,9 +186,8 @@ class Depth20Feed:
         for s in self.subs:
             s.mode = C.REQ_SUB_DEPTH
         self.stats = FeedStats()
-        url = (f"{settings.dhan_depth20_url}?token={settings.dhan_access_token}"
-               f"&clientId={settings.dhan_client_id}&authType=2")
-        self._conn = _Conn(90, url, self.subs, handler, self.stats, parser=lambda b: parse_depth(b, 20))
+        self._conn = _Conn(90, lambda: _auth_url(settings.dhan_depth20_url), self.subs, handler, self.stats,
+                           parser=lambda b: parse_depth(b, 20))
 
     async def run(self):
         await self._conn.run()
@@ -167,9 +203,7 @@ class CasFeed:
         for s in subs:
             s.mode = C.REQ_SUB_DEPTH
         self.stats = FeedStats()
-        url = (f"{settings.dhan_feed_url}?token={settings.dhan_access_token}"
-               f"&clientId={settings.dhan_client_id}&authType=2")
-        self._conn = _Conn(91, url, subs, handler, self.stats, parser=parse_cas)
+        self._conn = _Conn(91, lambda: _auth_url(settings.dhan_feed_url), subs, handler, self.stats, parser=parse_cas)
 
     async def run(self):
         await self._conn.run()

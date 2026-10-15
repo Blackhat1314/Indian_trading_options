@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     dhan_scrip_master_url: str = Field(
         "https://images.dhan.co/api-data/api-scrip-master-detailed.csv", alias="DHAN_SCRIP_MASTER_URL"
     )
+    # Dhan Web tokens last 24 h: the ingestor renews the token by itself while it is valid (td/dhan/token.py),
+    # in the morning window from DHAN_TOKEN_RENEW_AT (IST) or 2 h before it runs out. DHAN_PIN + DHAN_TOTP_SECRET
+    # (both optional) let it log in again after the token has lapsed (e.g. the server was off for a day).
+    dhan_token_auto_renew: bool = Field(True, alias="DHAN_TOKEN_AUTO_RENEW")
+    dhan_token_renew_at: str = Field("08:30", alias="DHAN_TOKEN_RENEW_AT")
+    dhan_pin: str = Field("", alias="DHAN_PIN")
+    dhan_totp_secret: str = Field("", alias="DHAN_TOTP_SECRET")
+    dhan_auth_url: str = Field("https://auth.dhan.co", alias="DHAN_AUTH_URL")
 
     # Dhan published limits (Oct 2026 docs) — keep configurable in case they change
     limit_data_per_sec: float = Field(5, alias="LIMIT_DATA_PER_SEC")
