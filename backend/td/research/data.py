@@ -3,11 +3,14 @@
 Every research model works from daily bars in the lake. The F&O universe is kept fresh by the ingestor's
 auto-history, but a user can research any NSE equity: in live mode (DATA_SOURCE=dhan) a stock that is missing,
 short (< 2 years) or stale is topped up with ONE call to Dhan's historical API (it returns 10+ years at once),
-and only while the shared daily data budget keeps `research_fetch_reserve` calls for the live desks. A failed
-fetch never fails the caller: the lake is used, the reason comes back as a warning and the symbol is not
-retried for 10 minutes. Sim mode never fetches and only knows the simulator's universe.
+and only while the shared daily data budget keeps what the live app needs for its own day (the larger of
+`research_fetch_reserve` and the backfill's reserve) and research's own allowance of FETCH_PER_DAY top-ups a day
+is not used up. All top-ups share one Dhan client, so its 5/s rate limit covers them together. A failed fetch
+never fails the caller: the lake is used, the reason comes back as a warning and the symbol is not retried for
+10 minutes. Sim mode never fetches and only knows the simulator's universe.
 
-Live prices, news and market breadth come from the snapshots the analytics worker already publishes to Redis.
+Live prices, news and market breadth come from the snapshots the analytics worker already publishes to Redis
+(in live mode without the simulator's headlines: sim and live sessions share one Redis).
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ MIN_YEARS = 2.0                          # below this a stock's history is toppe
 FETCH_YEARS_DAYS = 3653                  # one daily request reaches back 10 years
 NEG_CACHE_S = 600.0                      # a failed fetch is not retried for 10 minutes
 CACHE_S = 30.0                           # lake listing cache (search runs on every keystroke)
+FETCH_PER_DAY = 300                      # research's own cap on Dhan history top-ups per IST day (all users)
 EQUITY_SERIES = {"EQ", "BE", "BZ", "SM", "ST"}   # NSE equity shares: main board, trade-for-trade, SME
 
 
@@ -160,6 +164,9 @@ class ResearchData:
         self.redis = redis
         self.lake = lake or Lake()
         self.rest_factory = rest_factory or (lambda: DhanRest(redis=redis))
+        self._rest: DhanRest | None = None                   # one shared client, built on the first top-up
+        self.fetch_budget = DailyBudget("research_fetch", int(getattr(settings, "research_fetch_per_day",
+                                                                      FETCH_PER_DAY)), redis)
         self._locks: dict[str, asyncio.Lock] = {}
         self._neg: dict[str, tuple[float, str]] = {}          # symbol -> (retry after, warning)
         self._topped: dict[str, date] = {}                    # symbol -> day a fetch succeeded (once per day)
@@ -359,17 +366,36 @@ class ResearchData:
             return "stale"
         return None
 
+    def _client(self) -> DhanRest:
+        """The Dhan client every top-up shares (one rate limiter, one connection pool), built on first use."""
+        if self._rest is None:
+            self._rest = self.rest_factory()
+        return self._rest
+
+    async def aclose(self) -> None:
+        """Close the shared Dhan client (app shutdown); the next top-up builds a new one."""
+        rest, self._rest = self._rest, None
+        close = getattr(rest, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
+
     async def _fetch(self, info: SymbolInfo, df: pd.DataFrame, today: date, reason: str) -> tuple[int, str | None]:
         """One Dhan daily request for the missing range. Returns (bars written, warning or None)."""
+        from ..backfill import classify, min_reserve
+
         hist = HIST.get((info.kind, info.seg or ""))
         if info.sid is None or hist is None:
             return 0, f"no Dhan security id for {info.symbol} — using the lake only"
         using = "using the lake" if not df.empty else "no history available"
+        reserve = max(settings.research_fetch_reserve, min_reserve())   # never eat into the live app's own day
         budget = DailyBudget("dhan_data", settings.limit_data_per_day, self.redis)
         left = await budget.remaining()
-        if left <= settings.research_fetch_reserve:
-            return 0, (f"Dhan daily data budget nearly used ({left} calls left, {settings.research_fetch_reserve} "
-                       f"kept for the live desks) — {using}")
+        if left <= reserve:
+            return 0, (f"Dhan daily data budget nearly used ({left} calls left, {reserve} kept for the live "
+                       f"desks) — {using}")
         if reason in ("empty", "short"):
             start = today - timedelta(days=FETCH_YEARS_DAYS)
         else:
@@ -380,26 +406,26 @@ class ResearchData:
             return 0, None
         seg, instrument = hist
         try:
-            rest = self.rest_factory()
+            rest = self._client()
         except Exception as e:                          # e.g. no credentials: the lake still serves
             log.warning("history fetch %s: Dhan client unavailable: %s", info.symbol, e)
             return 0, f"Dhan client unavailable ({type(e).__name__}: {e}) — {using}"
+        try:
+            await self.fetch_budget.consume(1)          # atomic: concurrent top-ups cannot overshoot the cap
+        except BudgetExhausted:
+            return 0, (f"research's {self.fetch_budget.limit} Dhan history top-ups for today are used up — "
+                       f"{using}")
         try:
             payload = await rest.daily(info.sid, seg, instrument, start, today)
         except BudgetExhausted:
             return 0, f"Dhan daily data budget used up — {using}"
         except DhanError as e:
+            if reason == "stale" and not df.empty and classify(e) == "nodata":
+                return 0, None                          # DH-907 on a gap-only range (a holiday): nothing new yet
             return 0, f"{_dhan_reason(e)} — {using}"
         except Exception as e:                          # never fail the caller over a history top-up
             log.warning("history fetch %s failed: %s", info.symbol, e, exc_info=True)
             return 0, f"Dhan history fetch failed ({type(e).__name__}) — {using}"
-        finally:
-            close = getattr(rest, "close", None)
-            if close is not None:
-                try:
-                    await close()
-                except Exception:
-                    pass
         bars = clean_daily(bars_from_dhan(payload or {}))
         if not bars.empty:
             bars["ts"] = day_start(bars["ts"])              # Dhan stamps daily bars at IST midnight; make sure
@@ -455,7 +481,8 @@ class ResearchData:
         return round(px, 2)
 
     async def news(self, symbol: str, days: int = 30, limit: int = 25) -> list[dict]:
-        """Headlines that name the stock (or that the news engine maps onto it), newest first."""
+        """Headlines that name the stock (or that the news engine maps onto it), newest first. In live mode the
+        simulator's headlines are skipped: an earlier sim session leaves them in the shared Redis for weeks."""
         from ..analytics.news import classify
 
         sym = (symbol or "").strip().upper()
@@ -463,6 +490,9 @@ class ResearchData:
         found: dict[str, dict] = {}
 
         def add(it: dict, impact: int | None) -> None:
+            if self.live and (str(it.get("source") or "").upper() == "SIM"
+                              or str(it.get("id") or "").startswith("sim-")):
+                return                                  # invented by the simulator, not news about a real stock
             title = str(it.get("title") or "").strip()
             try:
                 ts = float(it.get("ts") or 0)
@@ -525,9 +555,13 @@ class ResearchData:
         if market:
             sectors = [{k: v for k, v in s.items() if k != "members"} for s in market.get("sectors") or []
                        if isinstance(s, dict)]
-            out["market"] = {"ts": market.get("ts"), "phase": market.get("phase"),
-                             "indices": market.get("indices") or [], "breadth": market.get("breadth") or {},
-                             "sectors": sectors}
+            breadth = market.get("breadth") if isinstance(market.get("breadth"), dict) else {}
+            if not breadth.get("n", (breadth.get("adv") or 0) + (breadth.get("dec") or 0)):
+                breadth = {}                            # analytics' sentinel before any price (n = 0): no reading
+            indices = market.get("indices") or []
+            if indices or breadth or sectors:
+                out["market"] = {"ts": market.get("ts"), "phase": market.get("phase"), "indices": indices,
+                                 "breadth": breadth, "sectors": sectors}
         if not symbol:
             if rows:
                 out["swing"] = {"ts": swing.get("ts"), "rules": swing.get("rules") or {}, "rows": rows}

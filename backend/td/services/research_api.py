@@ -15,6 +15,7 @@ import asyncio
 import logging
 import math
 import zlib
+from contextlib import asynccontextmanager
 from typing import Annotated, Any, Callable, Literal
 
 import orjson
@@ -193,6 +194,15 @@ class Research:
             return AiService(self.data, screener, quant, redis=self.redis, mc=self._mc)
         return self._lazy("_ai", "AI analyst", build)
 
+    async def aclose(self) -> None:
+        """App shutdown: close the history layer's shared Dhan client (built again on the next top-up)."""
+        close = getattr(self.data, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception as e:
+                log.warning("research: closing the Dhan client failed: %s", e)
+
     def background(self, coro, what: str) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self.tasks.add(task)
@@ -256,8 +266,17 @@ def quant_drift(result: dict | None) -> tuple[float | None, str | None]:
 
 
 # ------------------------------------------------------------------ router
+@asynccontextmanager
+async def _lifespan(app):
+    """Nested inside the app's own lifespan (FastAPI merges a router's), so Redis is still open here."""
+    yield
+    rs = getattr(app.state, "research", None)
+    if rs is not None:
+        await rs.aclose()
+
+
 def make_router(current: Callable, admin: Callable, csrf: Callable) -> APIRouter:
-    router = APIRouter(prefix="/api/research", route_class=_Route)
+    router = APIRouter(prefix="/api/research", route_class=_Route, lifespan=_lifespan)
     write = [Depends(csrf)]
 
     async def resolve(rs: Research, symbol: str):

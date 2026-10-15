@@ -24,6 +24,11 @@ const H_KEYS = Object.keys(H_DAYS) as HKey[];
 const H_NAME: Record<string, string> = { "1M": "1 month", "3M": "3 months", "6M": "6 months", "1Y": "1 year", "2Y": "2 years", "3Y": "3 years" };
 const hName = (label: string, days: number) => H_NAME[label] ?? `${days} trading days`;
 const KEY_HORIZONS = new Set(["6M", "1Y", "2Y", "3Y"]);       // the horizons the research desks report on
+const BT_H: HKey[] = ["1M", "3M", "6M", "1Y"];                 // horizons the CALIBRATION backtest can score
+const BT_MAX_DAYS = Math.max(...BT_H.map((k) => H_DAYS[k]));
+/** Longer horizons have no out-of-sample check: too little history to score enough non-overlapping windows. */
+const untested = (days: number) => days > BT_MAX_DAYS;
+const UNTESTED_TITLE = "Not backtested: too little history for an out-of-sample check at this horizon (the calibration panel scores forecasts up to 1 year ahead), so this is model output, not measured odds.";
 
 const PATHS = ["2000", "10000", "25000"] as const;
 type PKey = (typeof PATHS)[number];
@@ -154,8 +159,13 @@ function Gate({ v, children, what, main = false }: { v: View; children: (r: McRe
 }
 
 // ------------------------------------------------------------------ target prices
+/** A number whose commas are digit grouping — Indian (1,65,000) or Western (165,000) — not a list. */
+const GROUPED = /^₹?\d{1,3}(?:,\d{2})*,\d{3}(?:\.\d+)?$|^₹?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/;
+
 function parseTargets(text: string, spot: number | null): { values: number[]; error: string | null } {
-  const tokens = text.replace(/\s+%/g, "%").split(/[\s;]+|,\s+/).map((t) => t.trim()).filter(Boolean);
+  const tokens = text.replace(/\s+%/g, "%").split(/[\s;]+|,\s+/)
+    .flatMap((t) => (t.includes(",") && !GROUPED.test(t) ? t.split(",") : [t]))   // "1650,1700" is two levels
+    .map((t) => t.trim()).filter(Boolean);
   const values: number[] = [];
   for (const tok of tokens) {
     const rel = /^([+\-−]?\d+(?:\.\d+)?)\s*%$/.exec(tok);
@@ -203,7 +213,7 @@ function TargetsField({ targets, setTargets, spot }: { targets: number[]; setTar
           <label htmlFor="mc-target-in" className="sr-only">Add target prices (₹ price or ± % from spot)</label>
           <input id="mc-target-in" className="filter-input mc-tin" value={text} placeholder="₹ or ±% · Enter"
             onChange={(e) => { setText(e.target.value); setErr(null); }} onKeyDown={onKey}
-            title="Price levels to test, e.g. 1650 or +10% / -15% from spot; several separated by spaces. Up to 6." />
+            title="Price levels to test, e.g. 1650 or +10% / -15% from spot; several separated by spaces or commas. Up to 6." />
           <button type="button" className="btn ghost mc-tadd" onClick={add} disabled={!text.trim()}>ADD</button>
         </>
       )}
@@ -310,11 +320,21 @@ function OutcomePanel({ v }: { v: View }) {
               <p className="mc-lead">
                 Half the paths end above <b>{inr(t.median)}</b> (<Ret v={t.median_ret} />); 9 in 10 end between <b>{inr(t.p5)}</b> and <b>{inr(t.p95)}</b>.
               </p>
+              {untested(r.horizon_days) && (
+                <p className="mc-note mc-untested-note" role="note">
+                  <b>Not backtested</b> — too little history for an out-of-sample check at this horizon (the calibration below scores
+                  forecasts up to 1 year ahead). This range and P(above spot) are what the model assumes, not measured odds.
+                </p>
+              )}
               <Stats min={118}>
                 <Stat label="Median" value={inr(t.median)} sub={<Ret v={t.median_ret} />} title="The middle outcome: half the paths end above it" />
                 <Stat label="Mean" value={inr(t.mean)} sub={<Ret v={t.exp_ret} />} title="Average outcome (expected return) — above the median because gains compound" />
-                <Stat label="P(above spot)" value={<ProbBar p={t.prob_up} label="" width={54} />} sub={`spot ${inr(r.spot)}`} title="Share of paths ending above today's price" />
-                <Stat label="90% range" value={<span className="mc-range">{inrShort(t.p5)}–{inrShort(t.p95)}</span>} sub="5th–95th pct" />
+                <Stat label="P(above spot)" value={<ProbBar p={t.prob_up} label="" width={54} />}
+                  sub={untested(r.horizon_days) ? <span className="warn">not backtested</span> : `spot ${inr(r.spot)}`}
+                  title={untested(r.horizon_days) ? `Share of paths ending above today's price (spot ${inr(r.spot)}). ${UNTESTED_TITLE}` : "Share of paths ending above today's price"} />
+                <Stat label="90% range" value={<span className="mc-range">{inrShort(t.p5)}–{inrShort(t.p95)}</span>}
+                  sub={untested(r.horizon_days) ? <span className="warn">not backtested</span> : "5th–95th pct"}
+                  title={untested(r.horizon_days) ? `5th–95th percentile. ${UNTESTED_TITLE}` : undefined} />
                 <Stat label="50% range" value={<span className="mc-range">{inrShort(t.p25)}–{inrShort(t.p75)}</span>} sub="25th–75th pct" />
                 <Stat label="Skew" value={fx(t.skew, 2)} sub={t.skew > 0.1 ? "upside tail" : t.skew < -0.1 ? "downside tail" : "symmetric"}
                   title="Shape of the outcome distribution: positive = big gains rarer but larger than big losses" />
@@ -393,8 +413,11 @@ function HorizonsPanel({ v }: { v: View }) {
               </thead>
               <tbody>
                 {r.horizons.map((h) => (
-                  <tr key={h.days} className={KEY_HORIZONS.has(h.label) ? "mc-key" : undefined}>
-                    <td className="l"><b>{h.label}</b> <small className="muted">{dateIST(h.ts)}</small></td>
+                  <tr key={h.days} className={KEY_HORIZONS.has(h.label) ? "mc-key" : undefined} title={untested(h.days) ? UNTESTED_TITLE : undefined}>
+                    <td className="l">
+                      <b>{h.label}</b> <small className="muted">{dateIST(h.ts)}</small>
+                      {untested(h.days) && <small className="mc-untested">not backtested</small>}
+                    </td>
                     <td>{inr(h.p5)}</td><td>{inr(h.p25)}</td><td className="b">{inr(h.p50)}</td><td>{inr(h.p75)}</td><td>{inr(h.p95)}</td>
                     <td><ProbBar p={h.prob_up} label="" width={44} /></td>
                     <td><Ret v={h.median_ret} /></td>
@@ -408,6 +431,10 @@ function HorizonsPanel({ v }: { v: View }) {
               Read a row as: “after 1Y, 1 path in 20 is below the 5% column and 1 in 20 above the 95% column.” The spread widens
               roughly with the square root of time. Every model here uses the same drift ({fracPct(r.inputs.drift_annual, 1)}/yr, {r.drift}),
               so medians differ between models only through the shape of risk.
+              {r.horizons.some((h) => untested(h.days))
+                ? <> Rows up to 1Y can be checked in CALIBRATION below; rows marked <b>not backtested</b> cannot — there is too little history
+                  for an out-of-sample check that far ahead, so their bands and P(up) are what the model assumes, not measured odds.</>
+                : <> How often bands like these held in the past: run CALIBRATION below.</>}
             </p>
           </>
         )}
@@ -617,7 +644,6 @@ function InputsPanel({ v }: { v: View }) {
 }
 
 // ------------------------------------------------------------------ calibration backtest
-const BT_H: HKey[] = ["1M", "3M", "6M", "1Y"];
 const BT_LB = ["1", "2", "3", "5"] as const;
 type BtLb = (typeof BT_LB)[number];
 const BT_ORIGINS = ["20", "40", "80"] as const;
@@ -649,6 +675,8 @@ function CalibrationPanel({ symbol, cfg, years }: { symbol: string; cfg: McCfg; 
   const req: McBacktestRequest = { horizon_days: H_DAYS[bh], model: cfg.model, drift: cfg.drift, lookback_years: Number(lb), origins: Number(origins), paths: 2000 };
   const start = () => { if (symbol) bt.run(symbol, req); };
   const differs = res && (res.model !== cfg.model || (res.drift !== cfg.drift && cfg.drift !== "quant"));
+  // n forecasts are at most n independent windows (older servers could report span / horizon above that)
+  const effN = res ? Math.min(res.effective_n, res.origins) : 0;
 
   const bar = (
     <>
@@ -692,14 +720,14 @@ function CalibrationPanel({ symbol, cfg, years }: { symbol: string; cfg: McCfg; 
             <Stat label="CRPS" value={`${fx(res.crps, 2)}%`} sub={`random walk ${fx(res.crps_naive, 2)}%`} title="Average distance between the forecast distribution and what happened, in % of spot (lower is better)" />
             <Stat label="Direction hit" value={pctOf(res.direction_hit)} sub="median's direction (coin ≈ 50%)"
               title="How often the simulated median pointed the right way. With a positive drift the median nearly always points up, so this mostly measures how often the stock rose." />
-            <Stat label="Independent windows" value={`≈ ${fx(res.effective_n, 0)}`} sub={`${res.origins} dates overlap`}
-              title="Forecast windows overlap, so the honest sample size is the history span divided by the horizon" tone={res.effective_n < 5 ? "amber" : undefined} />
+            <Stat label="Independent windows" value={`≈ ${fx(effN, 0)}`} sub={effN < res.origins ? `${res.origins} dates overlap` : `${res.origins} dates, no overlap`}
+              title="Overlapping forecast windows share most of their path, so the honest sample size is the history span divided by the horizon — never more than the number of dates" tone={effN < 5 ? "amber" : undefined} />
             <Stat label="Horizon · fit" value={`${res.horizon_days}d`} sub={`${shown!.req.lookback_years}y fit · ${fx(res.elapsed_ms / 1000, 1)}s`} />
           </Stats>
           <div className="mc-calib-grid">
             <div>
               <h3>How often the bands held the real price</h3>
-              <CoverageChart data={res.coverage} n={res.effective_n} />
+              <CoverageChart data={res.coverage} n={effN} />
             </div>
             <div>
               <h3>Where the real price fell in each forecast</h3>
@@ -719,6 +747,8 @@ function CalibrationPanel({ symbol, cfg, years }: { symbol: string; cfg: McCfg; 
             A simulation is only worth its calibration. This replays the current model at {origins} past dates, each time using only the data
             available then, and checks how often the real price {bh === "1Y" ? "a year" : hName(bh, H_DAYS[bh])} later landed inside its 50 / 80 / 90 % bands.
             Well-calibrated 90 % bands hold the price about 90 % of the time; a lot less means the fan is too narrow.
+            {untested(H_DAYS[cfg.h]) && <> The simulation above looks {hName(cfg.h, H_DAYS[cfg.h])} ahead, which cannot be backtested: horizons beyond
+              1 year leave too little history for an out-of-sample check.</>}
           </p>
         </div>
       )}

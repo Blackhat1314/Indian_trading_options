@@ -153,8 +153,9 @@ separate admin page (`/admin`): USERS, HISTORY and SYSTEM.
 Four desks for researching any NSE stock (type a name or symbol in the box at the top of each; all four follow
 the same stock). They work from the daily bars in the lake — the 5-year pull from **/admin → HISTORY** makes them
 much better — plus Screener.in pages and, for the written analysis, an AI model. A stock outside the lake is fetched
-from Dhan in one call (10 years of daily bars) when the token is valid and more than `RESEARCH_FETCH_RESERVE` calls
-are left today.
+from Dhan in one call (10 years of daily bars) when the token is valid, at most `RESEARCH_FETCH_PER_DAY` (300) times a
+day, and only while more calls are left than the live desks need for the rest of the day (2 000 on Pro, 800 on
+Basic, or `RESEARCH_FETCH_RESERVE` if higher).
 
 **Nothing here predicts prices with certainty, and the desks say so.** Every forecast is a probability range, and
 every model shows how good it has actually been on data it never saw.

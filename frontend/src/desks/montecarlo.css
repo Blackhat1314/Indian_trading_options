@@ -54,6 +54,10 @@
 .mc-note { margin: 0; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.45; color: var(--muted); }
 .mc-note b { color: var(--text-2); font-weight: 600; }
 .mc-pad { padding: 8px 10px 0; }
+/* horizons beyond the longest backtestable one: no out-of-sample check exists */
+.mc-untested { margin-left: 6px; font-family: var(--font-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--amber); white-space: nowrap; }
+.mc-untested-note { border-bottom: 1px solid var(--border); }
+.mc-untested-note b { color: var(--amber); }
 .mc-range { font-size: 12px; }
 .mc-empty { padding: 12px 12px 14px; color: var(--text-2); font-size: 12px; line-height: 1.5; }
 .mc-empty p { margin: 0 0 8px; max-width: 760px; }

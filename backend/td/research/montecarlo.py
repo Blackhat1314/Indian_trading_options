@@ -7,21 +7,31 @@ often as they claimed. So every result here is a distribution (fan, terminal his
 a naive random walk.
 
 Models share one structure. Each produces per-step "martingale" log returns M = ε − κ, where ε is the model's
-shock and κ = ln E[e^ε] its convexity (Itô) correction, so E[e^M] = 1 step by step:
+shock and κ ≈ ln E[e^ε] its one-step convexity (Itô) correction:
 - gbm: ε ~ N(0, σ²) with σ the lookback's daily vol; κ = σ²/2 (the textbook Itô term).
 - garch: GARCH(1,1)-t fitted with variance targeting (long-run variance = the window's, so one crash cannot set
-  the 3-year width), simulated from today's conditional variance; κ = σ²_t/2 per path and step (for unit-variance
-  t shocks the higher cumulants add < 0.01 %/yr at daily vols).
+  the 3-year width), simulated from today's conditional variance; κ = σ²_t/2 per path and step. That is exact only
+  for unclipped shocks: with very fat tails (ν below ~3.5) the clip below removes 5–25 % of the shock variance, so
+  σ²_t/2 over-corrects (roughly −1 to −3 %/yr at ν ≈ 2.7–2.8).
 - bootstrap: stationary block bootstrap (mean block 10 days) of the de-meaned window; κ = ln mean(e^ε) over the
-  window, exact for the resampled marginal.
+  window, exact for ONE resampled step. Blocks replay runs of consecutive real returns, so when those are
+  autocorrelated E[Π e^{M_s}] ≠ Π E[e^{M_s}]: momentum / circuit-run names would drift up (tens of % over 3
+  years), mean-reverting ones down.
 - jump: Merton jump-diffusion; jumps are days with |r − median| > 3·MAD-σ; κ = σ_d²/2 + λ(e^{μ_j + σ_j²/2} − 1),
   the compound-Poisson compensator.
 - regime: 2-state Gaussian HMM, Markov-switching from today's filtered state probabilities; state variances are
   scaled so the stationary variance equals the window's (the fit winsorises outliers); κ = σ²_state/2.
 - ensemble: equal mixture of garch, bootstrap, jump and regime (paths split between them).
-The drift is then added identically to every model: log price = Σ (g_s + M_s) with g_s = ln(1 + D_s)/252, so
-E[S_t] = S_0·Π e^{g_s} — the expected arithmetic annual return is exactly the chosen D (CAPM, shrunk history,
-zero, or the quant model's tilt fading into CAPM). Historical means are far too noisy to drive a forecast (5
+So κ is only a first approximation. After each member's paths are drawn, an empirical martingale correction
+(Duan & Simonato 1998) shifts step s of all that member's paths by one common constant, chosen so that the average
+of e^{M_1 + … + M_s} over the member's paths is exactly 1 at every step. That removes whatever κ misses (block
+autocorrelation, clipped tails, the variance cap) for every model alike. The cost: each member's whole
+distribution moves by the sampling error of its own mean (≈ sd(S_t/S_0)/√(the member's paths) — a fraction of a
+percent at the default path counts, more with very few paths).
+The drift is then added identically to every model: log price = Σ (g_s + M_s) with g_s = ln(1 + D_s)/252, so the
+simulated mean price is S_0·Π e^{g_s} at every step (spot·(1 + D)^{t/252} for a constant D) by construction — the
+expected arithmetic annual return is the chosen D (CAPM, shrunk history, zero, or the quant model's tilt fading
+into CAPM). Historical means are far too noisy to drive a forecast (5
 years of 30 % vol pin the mean only to ±13 %/yr), which is why CAPM is the default and state/regime means are
 shown for context but never simulated. Models differ only in the SHAPE of risk: vol clustering, fat tails,
 jumps, regimes.
@@ -339,7 +349,8 @@ def _fit(r: np.ndarray, model: str) -> _Fit:
 
 # ------------------------------------------------------------------ path generation
 def _member(f: _Fit, name: str, h: int, n: int, rng: np.random.Generator) -> np.ndarray:
-    """(n, h) martingale log returns M = clip(ε) − κ with E[e^M] = 1 per step (see the module docstring)."""
+    """(n, h) log returns M = clip(ε) − κ with E[e^M] ≈ 1 per step (see the module docstring); `_paths` then
+    makes them an exact martingale on average with `_martingale`."""
     L = f.clip
     if name == "gbm":
         M = rng.standard_normal((n, h))
@@ -389,10 +400,33 @@ def _member(f: _Fit, name: str, h: int, n: int, rng: np.random.Generator) -> np.
     raise ValueError(f"unknown model {name!r}")
 
 
+def _martingale(blk: np.ndarray, rows: int) -> None:
+    """Empirical martingale correction (Duan & Simonato 1998), in place: subtract from step s of every row of
+    blk (paths × steps of log returns) one common constant so that mean over rows of exp(cumsum(blk)) is exactly 1
+    at every step. The column means are accumulated `rows` rows at a time with a running maximum (log-sum-exp), so
+    temporaries stay ~CHUNK_CELLS and nothing overflows."""
+    m, h = blk.shape
+    if m == 0 or h == 0:
+        return
+    top = np.full(h, -np.inf)
+    acc = np.zeros(h)
+    for r0 in range(0, m, rows):
+        x = np.cumsum(blk[r0:r0 + rows], axis=1)
+        new = np.maximum(top, x.max(axis=0))
+        acc *= np.exp(top - new)
+        x -= new
+        np.exp(x, out=x)
+        acc += x.sum(axis=0)
+        top = new
+    adj = top + np.log(acc / m)                            # ln mean exp(cumsum) at each step
+    blk -= np.diff(adj, prepend=0.0)
+
+
 def _paths(f: _Fit, h: int, n: int, seed: int, key: tuple[int, ...] = ()) -> tuple[np.ndarray, list[dict] | None]:
     """(n, h) martingale log returns, ensemble members stacked in order; each member has its own RNG stream
     derived from (seed, key, member index), so results are deterministic and origins independent. Members are
-    generated in fixed-size row chunks so their temporaries stay ~CHUNK_CELLS whatever the path count."""
+    generated in fixed-size row chunks so their temporaries stay ~CHUNK_CELLS whatever the path count, and each
+    member is then corrected so its mean of e^{cumsum} is exactly 1 at every step (`_martingale`)."""
     k = len(f.members)
     counts = [n // k + (1 if i < n % k else 0) for i in range(k)]
     out = np.empty((n, h))
@@ -400,10 +434,12 @@ def _paths(f: _Fit, h: int, n: int, seed: int, key: tuple[int, ...] = ()) -> tup
     row = 0
     for i, (name, m) in enumerate(zip(f.members, counts)):
         rng = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(*key, i)))
+        row0 = row
         for r0 in range(0, m, rows):
             c = min(rows, m - r0)
             out[row:row + c] = _member(f, name, h, c, rng)
             row += c
+        _martingale(out[row0:row], rows)
     comps = None if k == 1 else [{"model": name, "weight": round(m / n, 4)} for name, m in zip(f.members, counts)]
     return out, comps
 
@@ -717,7 +753,8 @@ def backtest(df: pd.DataFrame, *, horizon_days: int, model: str = "ensemble", dr
     coverage = [{"level": lv, "hit_rate": _num(np.mean(hits[lv])), "expected": lv} for lv in COVER_LEVELS]
     c, cn = float(np.mean(crps)), float(np.mean(crps_naive))
     skill = 1.0 - c / cn if cn > 0 else 0.0
-    eff = max(1, int((cand[-1] - cand[0] + h) // h))
+    # independent windows: horizon lengths in the span of origins, but never more than the forecasts scored
+    eff = max(1, min(k, int((cand[-1] - cand[0] + h) // h)))
     log.debug("backtest %s/%s h=%d origins=%d: hit90 %.2f skill %.3f", model, drift, h, k, np.mean(hits[0.9]), skill)
     return {
         "model": model, "drift": drift, "horizon_days": h, "origins": int(k), "paths": n_paths,

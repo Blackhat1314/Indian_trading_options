@@ -44,6 +44,26 @@ def _garch_returns(n: int, seed: int) -> np.ndarray:
     return out[300:]
 
 
+def _ar1_returns(n: int, phi: float, sigma: float, seed: int) -> np.ndarray:
+    """Strongly autocorrelated daily returns (momentum / circuit-run style when phi > 0)."""
+    e = np.random.default_rng(seed).standard_normal(n + 200) * sigma
+    x = np.empty(n + 200)
+    x[0] = e[0]
+    for t in range(1, n + 200):
+        x[t] = phi * x[t - 1] + e[t]
+    return x[200:]
+
+
+def _garch_t_returns(n: int, seed: int, nu: float, omega: float, alpha: float, beta: float) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    z = tm.t_unit_sample(rng, nu, n + 300)
+    v, out = omega / (1 - alpha - beta), np.empty(n + 300)
+    for t in range(n + 300):
+        out[t] = math.sqrt(v) * z[t]
+        v = omega + alpha * out[t] ** 2 + beta * v
+    return out[300:]
+
+
 def _finite(obj) -> bool:
     if isinstance(obj, dict):
         return all(_finite(v) for v in obj.values())
@@ -94,6 +114,54 @@ def test_every_model_keeps_the_mean_on_the_drift(garch_df):
                           seed=4, rf=RF, erp=ERP)
         sd = res["terminal"]["std"] / math.sqrt(res["paths"])
         assert res["terminal"]["mean"] == pytest.approx(res["spot"], abs=4.5 * sd), model
+
+
+def _assert_mean_on_drift(res: dict, d: float) -> None:
+    """The simulated mean price is spot·(1 + D)^(t/252) at every fan step and every horizon."""
+    spot = res["spot"]
+    for p in res["fan"]:
+        assert p["mean"] == pytest.approx(spot * (1 + d) ** (p["t"] / 252), rel=1e-3, abs=0.01), p["t"]
+    for h in res["horizons"]:
+        exp_mean = spot * (1 + d) ** (h["days"] / 252)
+        assert h["mean"] == pytest.approx(exp_mean, rel=1e-3, abs=0.01), h["label"]
+        assert h["exp_ret"] == pytest.approx(exp_mean / spot - 1, abs=2e-3), h["label"]
+
+
+@pytest.mark.parametrize("model", ["bootstrap", "ensemble"])
+@pytest.mark.parametrize("drift", ["zero", "capm"])
+def test_mean_stays_on_the_drift_with_autocorrelated_returns(model, drift):
+    """Block bootstrap replays runs of consecutive returns: with strong autocorrelation the one-step κ alone let
+    the 3-year mean drift ~ +40 % (zero drift); the per-member martingale correction must hold it on the drift."""
+    df = _bars(_ar1_returns(1250, 0.5, 0.02, seed=1))
+    res = mc.simulate(df, horizon_days=756, paths=8000, model=model, drift=drift, lookback_years=5, seed=3,
+                      index_df=df, rf=RF, erp=ERP)        # the stock vs itself: beta exactly 1
+    d = 0.0 if drift == "zero" else RF + ERP
+    assert res["inputs"]["drift_annual"] == pytest.approx(d, abs=1e-4)
+    _assert_mean_on_drift(res, d)
+    one_y = next(x for x in res["horizons"] if x["label"] == "1Y")
+    assert one_y["p50"] < one_y["mean"]                  # the shift moves the whole distribution, shape intact
+
+
+def test_mean_stays_on_the_drift_for_low_nu_garch():
+    """Clipping very fat-tailed (ν < 3) t shocks removes part of their variance, so the σ²/2 Itô term alone
+    over-corrected (1Y mean ≈ 0.974 × spot here, 5 s.e. low); the martingale correction removes that."""
+    df = _bars(_garch_t_returns(1000, seed=2, nu=2.5, omega=4e-5, alpha=0.1, beta=0.88))
+    res = mc.simulate(df, horizon_days=252, paths=10000, model="garch", drift="zero", lookback_years=5, seed=3)
+    assert res["inputs"]["garch"]["nu"] < 3.5                       # the regime where the clip matters
+    _assert_mean_on_drift(res, 0.0)
+
+
+def test_martingale_correction_is_exact_and_chunk_independent():
+    rng = np.random.default_rng(5)
+    base = 0.03 * rng.standard_normal((50, 40))
+    base[:, 1:] += 0.6 * base[:, :-1]                    # autocorrelated steps: per-step κ would not suffice
+    a, b = base.copy(), base.copy()
+    mc._martingale(a, 7)                                 # several uneven chunks
+    mc._martingale(b, 50)                                # one chunk
+    np.testing.assert_allclose(np.exp(np.cumsum(a, axis=1)).mean(axis=0), 1.0, rtol=1e-12)
+    np.testing.assert_allclose(a, b, rtol=0, atol=1e-12)
+    shift = base - a                                     # one common constant per step
+    np.testing.assert_allclose(shift, np.broadcast_to(shift[0], shift.shape), rtol=0, atol=1e-12)
 
 
 # ------------------------------------------------------------------ simulate: shape & invariants
@@ -309,6 +377,19 @@ def test_backtest_has_no_look_ahead():
     ix = mc._series(index[index["ts"] <= p["ts"]])
     sim, _ = mc._origin_forecast(s, ix, i, 21, "ensemble", "capm", 2.0, 400, RF, ERP, 5)
     assert np.round(np.quantile(sim, [0.05, 0.5, 0.95]), 2).tolist() == [p["p5"], p["p50"], p["p95"]]
+
+
+def test_backtest_effective_n_never_exceeds_the_origins():
+    """Independent windows = horizon lengths in the span of origins, capped at the number of forecasts scored:
+    10 short forecasts spread over years are 10 windows, not ~200."""
+    df = _bars(_exact_normal(1500, 0.015, -0.5 * 0.015 ** 2, seed=14))
+    sparse = mc.backtest(df, horizon_days=5, model="gbm", drift="zero", lookback_years=2, origins=10, paths=500,
+                         seed=1)
+    assert sparse["origins"] == 10 and sparse["effective_n"] == 10
+    assert "over 10 origins (≈ 10 independent windows)" in sparse["verdict"]
+    dense = mc.backtest(df, horizon_days=63, model="gbm", drift="zero", lookback_years=2, origins=40, paths=500,
+                        seed=1)
+    assert 5 <= dense["effective_n"] < dense["origins"] == 40          # overlapping windows: span / horizon
 
 
 def test_backtest_needs_enough_history():

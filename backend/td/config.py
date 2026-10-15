@@ -122,7 +122,10 @@ class Settings(BaseSettings):
     # market assumptions for Monte Carlo drift (CAPM) — annual, decimal
     risk_free_rate: float = Field(0.065, alias="RISK_FREE_RATE")       # ~India 10y G-sec
     equity_risk_premium: float = Field(0.06, alias="EQUITY_RISK_PREMIUM")
-    research_fetch_reserve: int = Field(500, alias="RESEARCH_FETCH_RESERVE")   # keep this many Dhan calls/day
+    # research desks top up missing daily history from Dhan only while more than max(this, the live app's own daily
+    # need: 2000 on Pro / 800 on Basic) calls are left, and at most research_fetch_per_day times a day
+    research_fetch_reserve: int = Field(500, alias="RESEARCH_FETCH_RESERVE")
+    research_fetch_per_day: int = Field(300, alias="RESEARCH_FETCH_PER_DAY")
 
     @property
     def lake_dir(self) -> Path:

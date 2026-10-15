@@ -348,12 +348,33 @@ def test_screener_endpoint(app):
         assert out["symbol"] == "RELIANCE" and s.calls[-1] == ("RELIANCE", "auto", False)
         c.get("/api/research/screener/M%26M?refresh=1&view=standalone")
         assert s.calls[-1] == ("M&M", "standalone", True)
-        r = c.get("/api/research/screener/NOPE")
-        assert r.status_code == 404 and "not on Screener.in" in r.json()["detail"]
+        r = c.get("/api/research/screener/NOPE")                         # unresolved: still asked (BSE-only, aliases)
+        assert r.status_code == 404 and "not on Screener.in" in r.json()["detail"] and s.calls[-1][0] == "NOPE"
         r = c.get("/api/research/screener/DOWN")
         assert r.status_code == 502 and "HTTP 503" in r.json()["detail"]
         r = c.get("/api/research/screener/RELIANCE?view=weird")
         assert r.status_code == 422 and "view" in r.json()["detail"]
+
+
+def test_shutdown_closes_the_shared_dhan_client(app):
+    """The history layer keeps one Dhan client for every top-up; the app's shutdown closes it (inside the app's
+    own lifespan, so Redis is still open) and the next top-up builds a fresh one."""
+    gw, client, fakes, install = app
+
+    class Rest:
+        closed = 0
+
+        async def close(self):
+            Rest.closed += 1
+    with client() as c:
+        rs = install()
+        rs.data._rest = Rest()
+        assert c.get("/api/research/search", params={"q": "rel"}).status_code == 200
+        assert Rest.closed == 0
+    assert Rest.closed == 1 and rs.data._rest is None
+    with client() as c:                                                    # restart: same container, no client yet
+        assert c.get("/api/research/history/RELIANCE").status_code == 200
+    assert Rest.closed == 1
 
 
 def test_ai_endpoints(app):

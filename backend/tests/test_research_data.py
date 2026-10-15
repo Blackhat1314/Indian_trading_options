@@ -207,7 +207,7 @@ def test_empty_lake_fetches_ten_years_once(env):
         await put_universe(r)
         df, meta = await rd.daily("ZENTEC")
         fetches = [c for c in calls if c != "closed"]
-        assert len(fetches) == 1 and calls[-1] == "closed"               # one call, client closed
+        assert len(fetches) == 1 and "closed" not in calls               # one call; the client is kept
         c = fetches[0]
         assert (c["sid"], c["seg"], c["instrument"], c["end"]) == (7508, "NSE_EQ", "EQUITY", TODAY)
         assert TODAY - c["start"] >= timedelta(days=3650) and c["start"].weekday() < 5
@@ -217,6 +217,9 @@ def test_empty_lake_fetches_ten_years_once(env):
         assert list(df.columns) == ["ts", "open", "high", "low", "close", "volume"]
         df2, meta2 = await rd.daily("ZENTEC")                             # fresh now: no second call
         assert len([c for c in calls if c != "closed"]) == 1 and not meta2["fetched"] and len(df2) == len(df)
+        assert await rd.fetch_budget.used() == 1                          # research's own allowance counts it
+        await rd.aclose()                                                 # app shutdown closes the shared client
+        assert calls[-1] == "closed" and rd._rest is None
     run(main())
 
 
@@ -287,13 +290,102 @@ def test_budget_reserve_blocks_fetch(env):
     run(main())
 
 
+@pytest.mark.parametrize("plan, own, left, kept", [
+    ("pro", 500, 1500, 2000),          # the live app needs 2000 calls a day on Pro: 500 is not enough
+    ("basic", 500, 700, 800),
+    ("pro", 3000, 2500, 3000),         # a larger RESEARCH_FETCH_RESERVE still wins
+])
+def test_reserve_covers_the_live_apps_own_need(env, monkeypatch, plan, own, left, kept):
+    monkeypatch.setattr(settings, "dhan_plan", plan)
+    monkeypatch.setattr(settings, "research_fetch_reserve", own)
+
+    async def main():
+        rd, lake, calls, r = setup(env)
+        await put_universe(r)
+        lake.write("D", "RELIANCE", make_bars(date(2022, 1, 3), date(2026, 10, 2)))
+        await r.set(DailyBudget("dhan_data", 7000, r)._key(), 7000 - left)
+        df, meta = await rd.daily("RELIANCE")
+        assert calls == [] and f"{left} calls left, {kept} kept" in meta["warning"]
+        await r.set(DailyBudget("dhan_data", 7000, r)._key(), 7000 - kept - 1)          # one call above it
+        rd._neg.clear()
+        df, meta = await rd.daily("RELIANCE")
+        assert meta["fetched"] and len(calls) == 1
+    run(main())
+
+
+def test_research_has_its_own_daily_cap(env):
+    async def main():
+        rd, lake, calls, r = setup(env)
+        await put_universe(r)
+        assert rd.fetch_budget.limit == rdata.FETCH_PER_DAY == 300
+        lake.write("D", "RELIANCE", make_bars(date(2022, 1, 3), date(2026, 10, 2)))
+        await r.set(rd.fetch_budget._key(), rd.fetch_budget.limit)                   # 300 top-ups already today
+        df, meta = await rd.daily("RELIANCE")
+        assert calls == [] and not meta["fetched"] and not df.empty
+        assert "300 Dhan history top-ups for today are used up" in meta["warning"]
+        assert await DailyBudget("dhan_data", 7000, r).used() == 0                    # the shared budget is untouched
+    run(main())
+
+
+def test_one_shared_dhan_client(env):
+    async def main():
+        r = fakeredis.aioredis.FakeRedis()
+        await put_universe(r)
+        calls: list = []
+        built: list = []
+
+        def factory():
+            built.append(1)
+            return FakeRest(calls, delay=0.02)
+        rd = ResearchData(r, Lake(env / "lake"), rest_factory=factory)
+        await asyncio.gather(rd.daily("ZENTEC"), rd.daily("ARE&M"), rd.daily("DUALCO"))
+        assert len(built) == 1 and len(calls) == 3 and "closed" not in calls      # one client, one rate limiter
+        assert await rd.fetch_budget.used() == 3
+        await rd.aclose()
+        await rd.aclose()                                                         # idempotent
+        assert calls.count("closed") == 1
+        rd._topped.clear()
+        rd.lake.write("D", "TCS", make_bars(date(2022, 1, 3), date(2026, 10, 2)))
+        await rd.daily("TCS")
+        assert len(built) == 2                                                    # rebuilt after a shutdown
+    run(main())
+
+
+def test_dhan_no_data_on_a_holiday_gap_is_not_a_failure(env):
+    """Lake complete to Tuesday, Wednesday an exchange holiday, called on Thursday: Dhan answers the
+    [Wed, Thu) window with DH-907 — nothing new, not 'no daily history', and not retried all day."""
+    nodata = DhanError("/charts/historical: no data present", code="DH-907", status=400)
+
+    async def main():
+        rd, lake, calls, r = setup(env, fail=nodata)
+        await put_universe(r)
+        lake.write("D", "RELIANCE", make_bars(date(2022, 1, 3), date(2026, 10, 13)))
+        for _ in range(3):
+            df, meta = await rd.daily("RELIANCE")
+            assert meta["warning"] is None and not meta["fetched"]
+            assert df["ts"].iat[-1] == midnight(date(2026, 10, 13))
+        assert len(calls) == 1 and calls[0]["start"] == date(2026, 10, 14)
+        assert "RELIANCE" not in rd._neg and rd._topped["RELIANCE"] == TODAY
+        # an empty or short lake still reports it: there DH-907 means Dhan has nothing for the stock
+        df, meta = await rd.daily("ZENTEC")
+        assert df.empty and "Dhan has no daily history" in meta["warning"] and "ZENTEC" in rd._neg
+        lake.write("D", "TCS", make_bars(date(2025, 6, 2), date(2026, 10, 14)))
+        df, meta = await rd.daily("TCS")
+        assert "Dhan has no daily history" in meta["warning"] and "TCS" in rd._neg
+        # a genuinely long silence still shows through the lake's own staleness warning
+        lake.write("D", "ARE&M", make_bars(date(2022, 1, 3), date(2026, 9, 1)))
+        df, meta = await rd.daily("ARE&M")
+        assert meta["warning"] == "the last daily bar is from 2026-09-01"
+    run(main())
+
+
 def test_failure_becomes_warning_with_negative_cache(env):
     async def main():
         rd, lake, calls, r = setup(env, fail=DhanError("/charts/historical: Invalid token", code="DH-901", status=401))
         await put_universe(r)
         lake.write("D", "RELIANCE", make_bars(date(2022, 1, 3), date(2026, 10, 2)))
         df, meta = await rd.daily("RELIANCE")
-        assert len([c for c in calls if c != "closed"]) == 1 and "closed" in calls
+        assert len([c for c in calls if c != "closed"]) == 1
         assert "access token" in meta["warning"] and "using the lake" in meta["warning"] and not df.empty
         df, meta = await rd.daily("RELIANCE")                             # within 10 minutes: no retry
         assert len([c for c in calls if c != "closed"]) == 1 and "access token" in meta["warning"]
@@ -415,6 +507,30 @@ def test_news_for_a_symbol(env):
     run(main())
 
 
+def test_live_news_skips_simulator_headlines(env, monkeypatch):
+    """An earlier sim session leaves its invented headlines in the shared Redis (stream + news snapshot)."""
+    async def main():
+        rd, lake, calls, r = setup(env)
+        await put_universe(r)
+        now = time.time()
+        sim = {"id": "sim-2026-10-15-3", "ts": now - 600, "title": "Reliance Q2 profit falls 35% YoY",
+               "text": "Reliance Q2 profit falls 35% YoY. (simulated headline)", "symbols": ["RELIANCE"],
+               "source": "SIM", "sentiment": "negative"}
+        await r.xadd(bus.STREAM_NEWS, {"j": bus.dumps(sim)})
+        await r.xadd(bus.STREAM_NEWS, {"j": bus.dumps({"id": "x1", "ts": now - 60, "title": "Reliance real story",
+                                                       "symbols": ["RELIANCE"], "source": "DHAN"})})
+        await bus.publish_snapshot(r, "news", {"items": [
+            {**sim, "impacts": {"RELIANCE": -1}},
+            {"id": "sim-2026-10-15-9", "ts": now - 900, "title": "GIFT Nifty indicates a weak start",
+             "source": "", "impacts": {"RELIANCE": -1}},                    # sim id, no source
+            {"id": "m1", "ts": now - 300, "title": "Crude oil prices surge", "source": "DHAN",
+             "impacts": {"RELIANCE": 1}}]})
+        assert [n["id"] for n in await rd.news("RELIANCE")] == ["x1", "m1"]
+        monkeypatch.setattr(settings, "data_source", "sim")                 # the simulator still sees its own
+        assert {n["id"] for n in await rd.news("RELIANCE")} >= {"sim-2026-10-15-3", "sim-2026-10-15-9"}
+    run(main())
+
+
 def test_market_context(env):
     async def main():
         rd, lake, calls, r = setup(env)
@@ -425,7 +541,7 @@ def test_market_context(env):
                                                 "source": "dhan", "minute": 105})
         await bus.publish_snapshot(r, "market", {
             "ts": 1, "phase": "OPEN", "indices": [{"name": "NIFTY", "chg": 0.4}],
-            "breadth": {"adv": 120, "dec": 80}, "movers": {},
+            "breadth": {"n": 210, "adv": 120, "dec": 80, "unch": 10}, "movers": {},
             "sectors": [{"sector": "IT", "name": "IT", "chg": -0.3, "members": [{"symbol": "TCS"}]},
                         {"sector": "ENERGY", "name": "Energy", "chg": 1.1, "members": [{"symbol": "RELIANCE"}]}]})
         await bus.publish_snapshot(r, "swing", {"ts": 1, "rules": {"target": 6}, "stats": {},
@@ -442,6 +558,17 @@ def test_market_context(env):
         allrows = await rd.market_context()
         assert allrows["sector"] == {} and allrows["swing"]["rows"][0]["symbol"] == "RELIANCE"
         assert (await rd.market_context("TCS"))["swing"] == {}
+        # analytics running but nothing priced yet (before the first tick, feed down): its breadth is a 0/0
+        # sentinel, not a reading — and with no indices or sectors either, there is no market snapshot at all
+        sentinel = {"adv": 0, "dec": 0, "unch": 0, "above_vwap": 0, "n": 0}
+        await bus.publish_snapshot(r, "market", {"ts": 2, "phase": "PRE", "indices": [], "breadth": sentinel,
+                                                 "movers": {}, "sectors": []})
+        ctx = await rd.market_context("RELIANCE")
+        assert ctx["live"] and ctx["market"] == {} and ctx["sector"] == {}
+        await bus.publish_snapshot(r, "market", {"ts": 3, "phase": "OPEN", "breadth": sentinel, "sectors": [],
+                                                 "indices": [{"name": "NIFTY", "chg": 0.1}]})
+        ctx = await rd.market_context("RELIANCE")
+        assert ctx["market"]["breadth"] == {} and ctx["market"]["indices"][0]["name"] == "NIFTY"
     run(main())
 
 
