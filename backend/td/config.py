@@ -135,6 +135,11 @@ class Settings(BaseSettings):
     research_fetch_reserve: int = Field(500, alias="RESEARCH_FETCH_RESERVE")
     research_fetch_per_day: int = Field(300, alias="RESEARCH_FETCH_PER_DAY")
 
+    # ---- PAPER TRADE desk --------------------------------------------------
+    # The edge monitor shadow-trades every intraday signal and lets accounts trade a decision time only while its
+    # last 100 signals made money after costs. false = trade every signal regardless (not recommended).
+    paper_edge_monitor: bool = Field(True, alias="PAPER_EDGE_MONITOR")
+
     @property
     def lake_dir(self) -> Path:
         sub = "sim" if self.data_source == "sim" else "dhan"

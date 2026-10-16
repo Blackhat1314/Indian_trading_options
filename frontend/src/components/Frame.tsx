@@ -17,6 +17,7 @@ export const DESKS: { id: DeskId; key: string; label: string; cmd: string }[] = 
   { id: "screener", key: "F9", label: "SCREENER", cmd: "SCRN" },
   { id: "montecarlo", key: "F10", label: "MONTE CARLO", cmd: "MC" },
   { id: "quant", key: "Alt+Q", label: "QUANT", cmd: "QUANT" },
+  { id: "paper", key: "Alt+P", label: "PAPER TRADE", cmd: "PAPER" },
 ];
 // SYSTEM and the history pulls live on the separate admin page (/admin), for admins only.
 
@@ -202,7 +203,7 @@ export function Tabs() {
   const unread = useLive((s) => s.unreadAlerts);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // F-keys, Alt+1…9 / Alt+0 (10th desk) and Alt+Q; e.code, because Alt+key types other characters on macOS
+      // F-keys, Alt+1…9 / Alt+0 (10th desk), Alt+Q and Alt+P; e.code, because Alt+key types other characters on macOS
       const t = e.target as HTMLElement | null;
       const typing = !!t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA");
       if (typing && !/^F\d+$/.test(e.key)) return;          // Alt+letter / Alt+digit type characters in fields
@@ -295,8 +296,9 @@ export function HelpModal() {
           <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the command line</dd>
           <dt><kbd>F1</kbd>…<kbd>F10</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>0</kbd></dt><dd>Switch desk</dd>
           <dt><kbd>Alt</kbd>+<kbd>Q</kbd></dt><dd>QUANT desk</dd>
+          <dt><kbd>Alt</kbd>+<kbd>P</kbd></dt><dd>PAPER TRADE desk (sub-views: <kbd>1</kbd>…<kbd>5</kbd>)</dd>
           <dt>RELIANCE <kbd>GO</kbd></dt><dd>Load a symbol in the chart & depth</dd>
-          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO · AI · SCRN · MC · QUANT</dt><dd>Open a desk</dd>
+          <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO · AI · SCRN · MC · QUANT · PAPER</dt><dd>Open a desk</dd>
           <dt>ADMIN (top right)</dt><dd>Users, history pulls and system health — admins only</dd>
           <dt>CHAIN BANKNIFTY</dt><dd>Option chain for an underlying</dd>
           <dt>Click a row</dt><dd>Select the stock everywhere</dd>
