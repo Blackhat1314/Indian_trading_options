@@ -1,12 +1,13 @@
 import { create } from "zustand";
 import type { Me } from "./auth";
+import type { PaperSignals } from "./paper";
 import { getPref, setPref } from "./storage";
 import type {
   AlertFire, ChainSnap, Clock, FnoSnap, Instrument, Market, NewsItem, RankSnap, SwingSnap, TopSnap,
 } from "./types";
 
-export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant";
-const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant"];
+export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant" | "paper";
+const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant", "paper"];
 
 export interface Toast { id: number; kind: "alert" | "event"; title: string; body: string; ts: number }
 
@@ -32,6 +33,7 @@ export interface LiveState {
   fno: FnoSnap | null;
   chains: Record<string, ChainSnap>;
   swing: SwingSnap | null;
+  paper: PaperSignals | null;     // PAPER TRADE desk: today's paper-trading decisions + swing candidates (public)
   news: NewsItem[];
   quotes: Quotes | null;
   geo: Record<string, unknown>;    // geo:* snapshots keyed by topic
@@ -74,6 +76,7 @@ export const useLive = create<LiveState>((set, get) => ({
   fno: null,
   chains: {},
   swing: null,
+  paper: null,
   news: [],
   quotes: null,
   geo: {},
@@ -120,6 +123,7 @@ export const useLive = create<LiveState>((set, get) => ({
     else if (topic === "top") patch.top = data as TopSnap;
     else if (topic === "fno") patch.fno = data as FnoSnap;
     else if (topic === "swing") patch.swing = data as SwingSnap;
+    else if (topic === "paper") patch.paper = data as PaperSignals;
     else if (topic === "news") patch.news = (data as { items: NewsItem[] }).items;
     else if (topic === "quotes") patch.quotes = data as Quotes;
     else if (topic.startsWith("geo:")) patch.geo = { ...get().geo, [topic]: data };

@@ -27,9 +27,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "backend"
 COLORS = {"ingestor": "\033[33m", "analytics": "\033[36m", "geo": "\033[32m", "gateway": "\033[35m",
-          "backfill": "\033[34m"}
+          "backfill": "\033[34m", "paper": "\033[95m"}
 RESET = "\033[0m"
-OPTIONAL = {"backfill"}          # restarted when it exits; never stops the live stack
+OPTIONAL = {"backfill", "paper"}  # restarted when they exit; never stop the live stack
 RESTART_AFTER = 15               # seconds
 
 
@@ -121,6 +121,7 @@ def main() -> int:
         "ingestor": [py, "-m", "td.services.ingestor"],
         "analytics": [py, "-m", "td.services.analytics"],
         "geo": [py, "-m", "td.services.geo"],
+        "paper": [py, "-m", "td.services.paper"],
         "gateway": [py, "-m", "uvicorn", "td.services.gateway:app", "--host", settings.gateway_host,
                     "--port", str(port), "--log-level", "warning"],
         "backfill": [py, "-m", "td.services.backfiller"],

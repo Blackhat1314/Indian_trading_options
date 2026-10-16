@@ -47,6 +47,12 @@ services:
     <<: *app
     command: ["python", "-m", "td.services.geo"]
 
+  # PAPER TRADE desk: automatic intraday (09:30 / 10:00, long or short, out by 15:15) and swing (long-only) paper
+  # trading for every user who switched it on; accounts and trade books live in ./data/paper
+  paper:
+    <<: *app
+    command: ["python", "-m", "td.services.paper"]
+
   # history pulls for the admin page (/admin → HISTORY): its own container, paced around the live services and resumed after a
   # redeploy (job + progress live in ./data/backfill). Stopping it never affects the live desks.
   backfill:

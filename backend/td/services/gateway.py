@@ -816,6 +816,11 @@ from .research_api import make_router  # noqa: E402
 
 app.include_router(make_router(current=current, admin=admin, csrf=_csrf))
 
+# PAPER TRADE desk: per-user paper accounts run by td/services/paper.py — /api/paper/...
+from .paper_api import make_router as make_paper_router  # noqa: E402
+
+app.include_router(make_paper_router(current=current, csrf=_csrf))
+
 
 @app.get("/api/health")
 async def health():

@@ -25,6 +25,9 @@ F10 MONTE CARLO  10 000+ simulated price paths (GARCH-t, bootstrap, jumps, regim
 Alt+Q QUANT  next-day / week / month probabilities from a walk-forward-tested model (Kalman trend, GARCH, HMM
              regimes, momentum, mean reversion…) with its measured out-of-sample accuracy shown next to every number
 
+Alt+P PAPER TRADE  automatic paper trading per user: intraday (09:30 / 10:00, long or short, up to 5x, flat by
+             15:15) and swing (long-only) · trade book with why each trade opened and closed · backtest evidence
+
 /admin       a separate page for admins (log in at /login):
   USERS      accounts (admin / viewer), passwords, who is online
   HISTORY    pull the 5-year history from Dhan into the lake · progress, quota, coverage per symbol
@@ -238,6 +241,98 @@ every model shows how good it has actually been on data it never saw.
   without a measured edge is labelled "no reliable edge" and its signal is held at NEUTRAL** — on the current
   5-year lake that is the honest result for 1 day and 1 month (AUC ≈ 0.52), with only a weak edge at 1 week.
   It retrains daily in the background (~1 minute); admins can retrain on demand.
+
+## PAPER TRADE desk (Alt+P): automatic paper trading
+
+Every logged-in user gets their own paper account with two books. You set the money, and the engine decides
+everything else. No real orders are ever sent: fills are simulated against live (or simulated) prices, with the
+real Indian charge schedule and modelled slippage.
+
+| | Intraday | Swing |
+|---|---|---|
+| You set | capital, leverage 1–5x | capital |
+| Direction | long or short | long only |
+| Decides | 09:30 and 10:00 IST | after the close; buys at the next open |
+| Holds | until its stop or 15:15 (always flat by then) | days to weeks: trailing stop or 40-session time stop |
+| Engine | gradient-boosted trees + ridge ensemble on 40+ point-in-time features | multi-factor momentum score + market-regime risk scaling |
+
+**Intraday, step by step:**
+
+1. **Features.** At 09:30 every liquid F&O stock is described by ~40 point-in-time features. They cover the
+   opening gap, the move since the open in ATR units, opening-range width and position, relative volume, distance
+   from and slope of VWAP, the move against NIFTY after removing beta, trend efficiency, yesterday's levels, and
+   the 5/20-day context. Each also gets a rank against every other stock, plus market breadth.
+2. **Prediction.** Two models (long and short) predict the return of a trade held to 15:15 behind a structural
+   stop. The stop sits beyond the opening range at 09:30, or beyond the morning's extreme at 10:00. Each model is
+   the average of a ridge regression and gradient-boosted trees, re-fitted walk-forward.
+3. **Edge over cost.** A trade is taken only when the prediction beats that order's own cost by 0.10% (0.15% at
+   10:00). The cost is the brokerage and statutory charges for that order size plus slippage. At most 3 longs and
+   3 shorts per decision.
+4. **Sizing.** Each trade risks 0.5% of capital at its stop, and total exposure stays within your leverage.
+5. **Daily loss limit.** If the day is down 2%, the 10:00 decision is skipped.
+6. **Edge monitor.** Every signal is shadow-traded whether or not money goes on it. Paper accounts trade a
+   decision time only while its last 60 shadow trades made money after costs. It switches itself back on when the
+   record recovers.
+
+**Swing:** each close, it ranks liquid F&O stocks on six factors (robust z-scores):
+
+- 60-day return net of beta × NIFTY;
+- 60-day momentum;
+- volume accumulation;
+- trend strength × smoothness (90-day regression slope × R²);
+- expanding volatility;
+- nearness to the 52-week high.
+
+It holds up to 15 positions, each risking 0.6% at a 2.5 ATR stop, with a chandelier stop 4 ATR under the best close.
+Three warning lights (NIFTY under its 200-day and 50-day EMAs, under 40% of stocks above their 50-day EMA) scale
+new-position risk to 100 / 60 / 30 / 0%.
+
+**The book** records every trade: the setup name, a one-line reason, the model's drivers, the numbers at the
+decision, the sizing arithmetic, why it closed, and the charges broken down from gross to net.
+
+**Evidence**, from the Dhan 5-year lake, 2022-10 → 2026-10, ₹10 lakh capital. The last 12 months (from 2025-10-01)
+were held out: they were not used to design or tune anything.
+
+| Strategy · period | Return per year | Sharpe | Worst drawdown | Trades |
+|---|---|---|---|---|
+| Intraday (5x) · 2022-10 → 2025-09 | +37.1% | 1.79 | -16.8% | 2,092 |
+| Intraday (5x) · **holdout** 2025-10 → 2026-10 | +21.2% (12 months) | 2.02 | -3.0% | 276 |
+| Swing · 2022-10 → 2025-09 | +30.4% | 1.55 | -13.9% | 377 |
+| Swing · **holdout** 2025-10 → 2026-10 | +7.2% (12 months) | 0.67 | -7.1% | 112 |
+| NIFTY 50 buy & hold · holdout | -8.9% (12 months) | -0.61 | -15.6% | — |
+
+How to read this honestly:
+
+- **Intraday.** Without the edge monitor the same models made +49.6% a year before the holdout but
+  **lost 13.7% in the holdout year**: the edge faded from March 2026. The monitor was added *after* seeing
+  that, so the holdout is not untouched for it. Its one setting is not fragile, though: windows of 30, 60,
+  100 and 150 signals all turned the holdout positive (+13% to +21%), and 100 was also the best monitored
+  window before the holdout.
+- **As of the last data day both intraday decision times are switched off by the monitor.** The last 100
+  signals averaged −0.32% (09:30) and −0.85% (10:00) after costs. A fresh install sits out intraday until
+  its signals recover. Swing is unaffected.
+- **Swing.** It uses fixed rules with no fitting. Its holdout result was never looked at while designing it.
+- **Survivorship bias.** The lake holds today's F&O list, so stocks that dropped out of F&O over the five years
+  are missing. That flatters long-only results somewhat.
+
+Run the backtests on your own server, so the EVIDENCE tab shows your data instead of the shipped summary:
+
+```
+docker compose exec paper python -m td.paper.backtest      # or: cd backend && python -m td.paper.backtest
+docker compose exec paper python -m td.paper.train         # refit the intraday models on your history now
+```
+
+Things to know:
+
+- **Retraining.** The intraday models ship pre-trained. In live mode the service re-fits them on your own minute
+  history once a month after the close, if the lake holds at least 250 days of it (pull it on the admin page →
+  HISTORY).
+- **Restarts.** A restart mid-session loses nothing. The service reads the clock, quotes and today's bars that
+  analytics publishes. Intraday positions left open by a stop at 15:15 are squared off at the next start.
+- **Data and charges.** Accounts and books live in `data/paper/`. Charges follow the usual discount-broker and NSE
+  schedule (`backend/td/paper/costs.py`); adjust them there if your broker differs.
+- **This is paper trading, not advice.** Backtests show what would have happened with these rules, not what will
+  happen. The intraday edge, in particular, weakened sharply in 2026.
 
 ## Admin page → HISTORY: pull the 5-year history
 
@@ -469,6 +564,7 @@ each day's close, so early moves mean-revert by construction.
 | `/` or `Ctrl+K` | command line |
 | `F1`…`F10` / `Alt+1`…`0` | switch desk |
 | `Alt+Q` | QUANT desk |
+| `Alt+P` | PAPER TRADE desk (`1`…`5` switch its views) |
 | `RELIANCE` ⏎ | load a symbol into chart and depth (on a research desk: into that desk) |
 | `TOP5` `MKT` `FNO` `SWING` `NEWS` `ALRT` `GEO` `AI` `SCRN` `MC` `QUANT` | open a desk |
 | `CHAIN BANKNIFTY` | option chain for an underlying |
@@ -485,11 +581,14 @@ backend/td/
   dhan/                REST client, websocket feeds (sharded), binary packet parser, instruments,
                        token keeper (daily access-token renewal)
   sim/simulator.py     market simulator (Dhan-identical packets) + synthetic history
-  services/            ingestor.py · analytics.py · geo.py · gateway.py · recorder.py · bootstrap.py (auto history)
+  services/            ingestor.py · analytics.py · geo.py · gateway.py · paper.py (+ paper_api.py) · recorder.py ·
+                       bootstrap.py (auto history)
   geo/                 world-event sources (GDELT, FIRMS, AIS, ADS-B, PortWatch, GPR, FRED), simulator, risk/impact engine, sites
   analytics/           intraday ranker · option math · SMC · swing · news · market breadth · alerts
   research/            research desks: tsmath (GARCH, Kalman, HMM, bootstrap…) · montecarlo · quant ·
                        screener (Screener.in) · llm (Claude / OpenAI-compatible) · ai (the analyst) · data
+  paper/               paper trading: features (point-in-time) · models (ridge + GBM, numpy) · intraday · swing ·
+                       sim (trade replay) · costs (charges, slippage) · broker (accounts, book) · train · backtest
   lake.py              Parquet lake (+ DuckDB coverage)
   ratelimit.py         token buckets, per-second limits shared across processes (Redis), daily budget, option-chain window
 backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker, news, swing, lake, geo parsers & rules, live-mode regressions,
