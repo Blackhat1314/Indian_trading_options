@@ -137,17 +137,32 @@ export function GeoMap(props: Props) {
   const labels = useRef<maplibregl.Marker[]>([]);
   const [ready, setReady] = useState(false);
   const [cursor, setCursor] = useState<string>("");
+  // the map draws with WebGL (the graphics card): if the browser cannot give it a context, or the graphics driver
+  // resets mid-session, only the map stops — the GEO panels keep working and the map can be reloaded in place
+  const [glError, setGlError] = useState<"create" | "lost" | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const { views } = props;
 
   // ---------------------------------------------------------------- create
   useEffect(() => {
     if (!box.current) return;
-    const map = new maplibregl.Map({
-      container: box.current, center: [62, 21], zoom: 2.9, minZoom: 1, maxZoom: 14, attributionControl: false,
-      renderWorldCopies: false, dragRotate: false, pitchWithRotate: false,
-      style: { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": "#03070d" } }] },
-    });
+    setReady(false);
+    let map: MLMap;
+    try {
+      map = new maplibregl.Map({
+        container: box.current, center: [62, 21], zoom: 2.9, minZoom: 1, maxZoom: 14, attributionControl: false,
+        renderWorldCopies: false, dragRotate: false, pitchWithRotate: false,
+        style: { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": "#03070d" } }] },
+      });
+    } catch (err) {
+      console.warn("GEO map: WebGL unavailable", err);
+      setGlError("create");
+      return;
+    }
+    setGlError(null);
     mapRef.current = map;
+    map.on("webglcontextlost", () => setGlError("lost"));
+    map.on("webglcontextrestored", () => setGlError(null));
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true,
@@ -216,10 +231,14 @@ export function GeoMap(props: Props) {
       setReady(true);
     });
     return () => {
-      map.remove();
+      try {
+        map.remove();
+      } catch {
+        /* a map whose context is already gone can fail to tear down: nothing left to free */
+      }
       mapRef.current = null;
     };
-  }, []);
+  }, [attempt]);
 
   // ---------------------------------------------------------------- visibility
   useEffect(() => {
@@ -340,6 +359,24 @@ export function GeoMap(props: Props) {
   return (
     <div className="geo-map-wrap">
       <div ref={box} className="geo-map" role="region" aria-label="World events map" />
+      {glError && (
+        <div className="geo-gl-error" role="alert">
+          <b>{glError === "lost" ? "The map lost its graphics context" : "The map could not start: WebGL is unavailable"}</b>
+          <p>
+            The map draws with your graphics card. {glError === "lost"
+              ? "The browser's graphics process reset (often a driver hiccup or memory pressure)."
+              : "The browser has WebGL switched off right now — usually after its graphics process crashed, or with hardware acceleration disabled."}{" "}
+            Everything else on the GEO desk keeps working.
+          </p>
+          <ul>
+            <li>Click <b>Reload map</b> below.</li>
+            <li>Still failing: close <i>all</i> browser windows and reopen (Chrome re-enables WebGL on a fresh start).</li>
+            <li>Chrome / Edge: Settings → System → turn on <i>Use graphics acceleration when available</i>; check <code>chrome://gpu</code>.</li>
+            <li>Keep the graphics driver up to date.</li>
+          </ul>
+          <button type="button" className="btn" onClick={() => { setGlError(null); setAttempt((a) => a + 1); }}>Reload map</button>
+        </div>
+      )}
       <div className="geo-presets" role="group" aria-label="Map regions">
         {PRESETS.map((p) => <button type="button" key={p.id} onClick={() => go(p)}>{p.label}</button>)}
       </div>
