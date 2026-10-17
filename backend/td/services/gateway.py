@@ -17,14 +17,14 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import orjson
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -840,12 +840,25 @@ if FRONTEND.exists():
 
     ROOT_DIST = FRONTEND.resolve()
 
+    NO_STORE = {"Cache-Control": "no-store"}          # pages: never shown from cache after a logout
+
+    def _signed_out(request: Request) -> bool:
+        """The terminal and the admin page need a login: a signed-out browser is sent to /login before any of their
+        code loads, so not even an empty terminal flashes up. With legacy access keys configured the key lives in
+        the browser's storage (invisible to a page request), so the page then checks for itself."""
+        return login_required() and not settings.access_key_map() and \
+            identify(request.cookies, request.query_params.get("key")) is None
+
     @app.get("/{path:path}")
-    async def spa(path: str):
+    async def spa(path: str, request: Request):
         f = (FRONTEND / path).resolve()
         if path and f.is_relative_to(ROOT_DIST) and f.is_file():         # never serve files outside dist
             return FileResponse(f)
-        page = PAGES.get(path.strip("/").split("/")[0])
+        name = path.strip("/").split("/")[0]
+        page = PAGES.get(name)
+        if name != "login" and _signed_out(request):
+            nxt = "/" + path.lstrip("/") + (f"?{request.url.query}" if request.url.query else "")
+            return RedirectResponse(f"/login?next={quote(nxt, safe='/')}", status_code=302, headers=NO_STORE)
         if page and (FRONTEND / page).is_file():
-            return FileResponse(FRONTEND / page)
-        return FileResponse(FRONTEND / "index.html")
+            return FileResponse(FRONTEND / page, headers=NO_STORE)
+        return FileResponse(FRONTEND / "index.html", headers=NO_STORE)

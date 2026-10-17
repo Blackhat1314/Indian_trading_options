@@ -321,3 +321,30 @@ def test_disabled_user_loses_the_live_feed(monkeypatch, tmp_path):
                 while True:
                     ws.receive_text()
             assert e.value.code == 4401
+
+
+def test_signed_out_pages_redirect_before_any_terminal_code(monkeypatch, tmp_path):
+    from td.config import settings
+    gw, c = _client(monkeypatch, tmp_path, host="203.0.113.7")
+    if not gw.FRONTEND.exists():
+        pytest.skip("frontend not built")
+    monkeypatch.setattr(settings, "access_keys", "")
+    gw.users.create("shivam", "a-long-password", "admin")
+    asset = next((gw.FRONTEND / "assets").iterdir()).name
+    with c:
+        r = c.get("/", follow_redirects=False)
+        assert r.status_code == 302 and r.headers["location"] == "/login?next=/"
+        assert r.headers["cache-control"] == "no-store"
+        r = c.get("/admin?tab=users", follow_redirects=False)
+        assert r.status_code == 302 and r.headers["location"] == "/login?next=/admin%3Ftab%3Dusers"
+        assert c.get("/login", follow_redirects=False).status_code == 200            # the login page itself
+        assert c.get(f"/assets/{asset}", follow_redirects=False).status_code == 200    # its scripts and styles
+        assert c.post("/api/auth/login", json={"username": "shivam", "password": "a-long-password"},
+                      headers=H).status_code == 200
+        r = c.get("/", follow_redirects=False)
+        assert r.status_code == 200 and b"TradeDesk" in r.content and r.headers["cache-control"] == "no-store"
+    # legacy access keys live in the browser's storage, not a cookie: the page checks for itself then
+    monkeypatch.setattr(settings, "access_keys", "friend:k123456789")
+    with c:
+        c.cookies.clear()
+        assert c.get("/", follow_redirects=False).status_code == 200

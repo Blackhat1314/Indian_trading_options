@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { DeskBoundary } from "./components/DeskBoundary";
 import { HelpModal, StatusBar, Tabs, Toasts, TopBar } from "./components/Frame";
 import { Empty } from "./components/ui";
@@ -43,8 +43,30 @@ export default function App() {
   const connError = useLive((s) => s.connError);
   const setUniverse = useLive((s) => s.setUniverse);
   const setMe = useLive((s) => s.setMe);
+  // nothing of the terminal is drawn, connected or fetched until the gateway says who this is
+  // (a signed-out browser is normally redirected by the gateway before this page even loads)
+  const [authed, setAuthed] = useState(false);
+  const [slow, setSlow] = useState(false);
 
   useEffect(() => {
+    let timer = 0;
+    const loadMe = () =>
+      getMe().then((m) => {
+        if (m.login_required && !m.user) toLogin();
+        else {
+          setMe(m);
+          setAuthed(true);
+        }
+      }).catch(() => {
+        setSlow(true);
+        timer = window.setTimeout(loadMe, 3000);
+      });
+    loadMe();
+    return () => window.clearTimeout(timer);
+  }, [setMe]);
+
+  useEffect(() => {
+    if (!authed) return;
     live.sub(BASE_TOPICS);
     live.connect();
     const loadUniverse = () =>
@@ -56,13 +78,7 @@ export default function App() {
         else window.setTimeout(loadUniverse, 3000);
       });
     loadUniverse();
-    const loadMe = () =>
-      getMe().then((m) => {
-        if (m.login_required && !m.user) toLogin();
-        else setMe(m);
-      }).catch(() => window.setTimeout(loadMe, 5000));
-    loadMe();
-  }, [setUniverse, setMe]);
+  }, [authed, setUniverse]);
 
   useEffect(() => {
     const want = DESK_TOPICS[desk];
@@ -71,6 +87,14 @@ export default function App() {
       .filter((t) => !want.includes(t) && !BASE_TOPICS.includes(t));
     live.unsub(others);
   }, [desk]);
+
+  if (!authed) {
+    return (
+      <main className="login-page" aria-busy="true">
+        <p className="small muted" role="status">{slow ? "Connecting to the gateway…" : ""}</p>
+      </main>
+    );
+  }
 
   return (
     <div className="app">
