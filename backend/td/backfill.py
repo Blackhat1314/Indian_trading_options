@@ -30,6 +30,7 @@ from .config import settings
 from .dhan.rest import DhanError
 from .lake import Lake, bars_from_dhan
 from .ratelimit import BudgetExhausted
+from .timeutil import from_epoch
 
 log = logging.getLogger("td.backfill")
 
@@ -39,7 +40,9 @@ INTRADAY_CHUNK_DAYS = 90       # Dhan: max 90 days per intraday request
 DAILY_CHUNK_DAYS = 3660       # one daily request returns 10+ years (no documented cap): 1 call per symbol
 INTRADAY_MAX_YEARS = 5         # Dhan keeps 5 years of intraday bars
 MAX_ATTEMPTS = 4               # per request, for rate-limit / network errors (then it is reported as failed)
-EMPTY_OK_DAYS = 14             # a bar-less 200 for a longer range is suspicious: not recorded as covered
+EMPTY_OK_DAYS = 14             # a bar-less 200 for a longer range is suspicious: not recorded as covered…
+EMPTY_STRIKES = 2              # …unless it ends before the stock's first trading day, or comes back empty again in a
+                               # later run (Dhan really has nothing there): then it is recorded, not retried forever
 TEST_SYMBOL = re.compile(r"NSETEST$")          # exchange test scrips Dhan lists among the F&O underlyings
 AUTH_CODES = {"806", "807", "808", "809", "810", "DH-901", "DH-902", "DH-903"}
 RATE_CODES = {"805", "DH-904", "RL001"}
@@ -416,6 +419,39 @@ async def run_jobs(jobs: list[Job], rest, lake: Lake, st: dict, *, today: date, 
         if on_progress:
             on_progress(prog)
 
+    first_daily: dict[str, date | None] = {}
+    strikes: dict[str, int] = st.setdefault("empty_strikes", {})
+
+    def listed_on(symbol: str) -> date | None:
+        """The stock's first daily bar in the lake: its first trading day (listing) once the daily pull, which runs
+        newest chunk first and before the 1-minute requests, has reached it."""
+        if symbol not in first_daily:
+            try:
+                d = lake.read(LAKE_NAME["D"], symbol)
+            except Exception:
+                d = None
+            first_daily[symbol] = (from_epoch(int(d["ts"].min())).date()
+                                   if d is not None and len(d) else None)
+        return first_daily[symbol]
+
+    def empty_long(job: Job) -> None:
+        """A bar-less answer for a long range: before the stock existed → nothing to fetch, recorded; Dhan having
+        nothing there twice in separate runs → recorded; otherwise retried next run (it can be a passing hiccup)."""
+        first = listed_on(job.symbol)
+        if first and date.fromisoformat(job.end) <= first:
+            record(st, "empty", job, 1, today)
+            prog.empty += 1
+            strikes.pop(job.key, None)
+            log.info("%s: before %s's first trading day %s — nothing to fetch", job.label, job.symbol, first)
+        elif strikes.get(job.key, 0) + 1 >= EMPTY_STRIKES:
+            record(st, "empty", job, 1, today)
+            prog.empty += 1
+            strikes.pop(job.key, None)
+            log.info("%s: empty again — Dhan has no data for this range, recorded as empty", job.label)
+        else:
+            strikes[job.key] = strikes.get(job.key, 0) + 1
+            fail(job, "empty response for a long range (retried next run)")
+
     def fail(job: Job, msg: str) -> None:
         st["failed"][job.key] = msg[:200]
         prog.failed += 1
@@ -452,12 +488,19 @@ async def run_jobs(jobs: list[Job], rest, lake: Lake, st: dict, *, today: date, 
             try:
                 df = bars_from_dhan(await fetch(rest, job))
                 if df.empty and (date.fromisoformat(job.end) - date.fromisoformat(job.start)).days > EMPTY_OK_DAYS:
-                    fail(job, "empty response for a long range (retried next run)")
+                    await asyncio.to_thread(listed_on, job.symbol)        # file read off the event loop
+                    empty_long(job)
                 elif df.empty:
                     record(st, "empty", job, 1, today)
                     prog.empty += 1
                 else:
                     await asyncio.to_thread(lake.write, LAKE_NAME[job.interval], job.symbol, df)
+                    if job.interval == "D":                              # keep the first-trading-day view current
+                        first = from_epoch(int(df["ts"].min())).date()
+                        known = first_daily.get(job.symbol)
+                        if job.symbol in first_daily and (known is None or first < known):
+                            first_daily[job.symbol] = first
+                    strikes.pop(job.key, None)
                     record(st, "done", job, len(df), today)
                     prog.ok += 1
                     prog.rows += len(df)

@@ -356,6 +356,42 @@ def test_empty_long_range_is_not_recorded(tmp_path):
     longs = [j for j in jobs if (date.fromisoformat(j.end) - date.fromisoformat(j.start)).days > bf.EMPTY_OK_DAYS]
     assert prog.failed == len(longs) and len(st["failed"]) == len(longs)
     assert not any(k in st["empty"] for k in st["failed"])
+    # empty again in a later run: Dhan really has nothing there — recorded, no longer retried every run
+    again = [j for j in jobs if j.key in st["failed"]]
+    _, prog = run(bf.run_jobs(again, Empty(), Lake(tmp_path), st, today=TODAY, rate=50, save=lambda s: None))
+    assert prog.failed == 0 and prog.empty == len(again) and not st["empty_strikes"]
+    assert bf.make_jobs(bf.targets(UNI, {"RELIANCE"}), ["1"], 1, TODAY, bf.coverage_from_state(st, TODAY)) == []
+
+
+class Listed(FakeRest):
+    """A stock that started trading on LISTED: Dhan has no bars before it."""
+    LISTED = date(2026, 6, 1)
+
+    async def daily(self, sid, seg, kind, start, end, **k):
+        out = await super().daily(sid, seg, kind, start, end, **k)
+        return self._clip(out)
+
+    async def intraday(self, sid, seg, kind, interval, start, end, **k):
+        out = await super().intraday(sid, seg, kind, interval, start, end, **k)
+        return self._clip(out)
+
+    def _clip(self, out):
+        t0 = datetime(self.LISTED.year, self.LISTED.month, self.LISTED.day, tzinfo=IST).timestamp()
+        keep = [i for i, t in enumerate(out["timestamp"]) if t >= t0]
+        return {k: [v[i] for i in keep] for k, v in out.items()} if keep else {}
+
+
+def test_ranges_before_the_listing_are_empty_not_failures(tmp_path):
+    jobs = bf.make_jobs(bf.targets(UNI, {"RELIANCE"}), ["D", "1"], 2, TODAY)
+    st = {"done": {}, "empty": {}, "failed": {}}
+    lake = Lake(tmp_path)
+    _, prog = run(bf.run_jobs(jobs, Listed(), lake, st, today=TODAY, rate=50, concurrency=1, save=lambda s: None))
+    assert prog.failed == 0 and not st["failed"]                     # nothing retried forever
+    before = [j for j in jobs if date.fromisoformat(j.end) <= Listed.LISTED]
+    assert before and all(j.key in st["empty"] for j in before)        # daily and 1-minute alike
+    first = lake.read("D", "RELIANCE")["ts"].min()
+    assert datetime.fromtimestamp(int(first), tz=IST).date() == Listed.LISTED
+    assert bf.make_jobs(bf.targets(UNI, {"RELIANCE"}), ["D", "1"], 2, TODAY, bf.coverage_from_state(st, TODAY)) == []
 
 
 def test_gate_pause_does_not_outlive_the_pull():
