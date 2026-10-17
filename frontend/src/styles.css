@@ -631,6 +631,13 @@ fieldset.field { border: 0; margin: 0; padding: 0; min-width: 0; }
 
 .geo-map-wrap { position: absolute; inset: 0; }
 .geo-map, .geo-map-wrap > .geo-map.maplibregl-map { position: absolute; inset: 0; background: #03070d; }
+.geo-gl-error { position: absolute; z-index: 5; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(560px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; padding: 16px 18px;
+  background: var(--panel, #0b111b); border: 1px solid var(--amber, #ffb000); border-radius: 6px; font-size: 13px; line-height: 1.5; }
+.geo-gl-error b { color: var(--amber, #ffb000); }
+.geo-gl-error p, .geo-gl-error ul { margin: 8px 0; }
+.geo-gl-error ul { padding-left: 18px; }
+.geo-gl-error code { font-size: 12px; }
 .geo-presets { position: absolute; top: 8px; left: 8px; z-index: 2; display: flex; flex-wrap: wrap; gap: 0;
   border: 1px solid var(--border-2); border-radius: var(--r); overflow: hidden; background: rgba(11,16,23,.92); }
 .geo-presets button { border: 0; background: transparent; padding: 3px 8px; font-family: var(--font-mono); font-size: 10.5px;
