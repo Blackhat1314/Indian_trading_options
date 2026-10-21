@@ -3,11 +3,12 @@
 .desk-neural {
   overflow-y: auto; align-content: start;
   grid-template-columns: minmax(0, 1.15fr) minmax(360px, 1fr);
-  grid-template-rows: repeat(4, max-content);
+  grid-template-rows: repeat(5, max-content);
   grid-template-areas:
     "pick    pick"
     "call    quality"
     "lead    quality"
+    "intra   iq"
     "disc    disc";
 }
 .desk-neural .warn { color: var(--amber); }
@@ -29,6 +30,8 @@
 .nn-card-line.muted { color: var(--muted); }
 .nn-model-line { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 8px 10px 4px; font-size: 12px; color: var(--text-2); }
 .nn-tbl tbody tr { cursor: default; }
+.nn-scroll { overflow-x: auto; max-width: 100%; }
+.nn-scroll > .nn-tbl { min-width: 520px; }
 .nn-tbl td small { font-size: 10.5px; }
 .nn-cell { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
 .nn-verdict { white-space: normal !important; min-width: 120px; font-family: var(--font-ui) !important; font-size: 11.5px; color: var(--text-2); }
@@ -42,7 +45,11 @@
   background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r); color: var(--text);
 }
 .nn-steps code { font-size: 11.5px; }
+.desk-neural .lockbar { margin: 6px 0 0; }
+.nn-status { display: block; font-size: 10px; letter-spacing: .04em; color: var(--muted); }
+.nn-status.TARGET { color: var(--up); }
+.nn-status.INVALID { color: var(--down); }
 @media (max-width: 1180px) {
-  .desk-neural { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pick" "call" "quality" "lead" "disc"; }
+  .desk-neural { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pick" "call" "quality" "lead" "intra" "iq" "disc"; }
   .nn-cards, .nn-lead-grid { grid-template-columns: minmax(0, 1fr); }
 }

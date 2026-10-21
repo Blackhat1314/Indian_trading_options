@@ -436,6 +436,14 @@ def make_router(current: Callable, admin: Callable, csrf: Callable) -> APIRouter
         except Exception as e:
             raise _fail("neural model info", e) from e
 
+    @router.get("/neural-intraday-model")
+    async def neural_intraday_model(rs: State, who=Depends(current)):
+        """The 09:30 model's report card (its picks travel with the live `top` snapshot)."""
+        try:
+            return _JSON(await asyncio.to_thread(rs.neural.intraday_info))
+        except Exception as e:
+            raise _fail("09:30 model info", e) from e
+
     @router.get("/neural-leaderboard")
     async def neural_leaderboard(rs: State, h: int = 21, n: Annotated[int, Query(ge=1, le=50)] = 15,
                                  who=Depends(current)):
