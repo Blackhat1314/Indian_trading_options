@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     # ---- strategy ---------------------------------------------------------
     top_n: int = Field(5, alias="TOP_N")
     lock_time: str = Field("09:30:00", alias="LOCK_TIME")     # IST time the intraday picks lock
+    nse_holidays: str = Field("", alias="NSE_HOLIDAYS")       # extra closures, e.g. 2027-01-26,2027-03-22
     or_minutes: int = Field(15, alias="OR_MINUTES")           # opening range length
     min_turnover_cr: float = Field(5.0, alias="MIN_TURNOVER_CR")  # liquidity filter (₹ crore traded by lock)
 

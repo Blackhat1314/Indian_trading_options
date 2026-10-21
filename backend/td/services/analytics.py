@@ -30,6 +30,7 @@ from .. import bus
 from ..config import settings
 from ..dhan.instruments import Universe
 from ..lake import Lake
+from ..holidays import holiday_name
 from ..timeutil import IST, MARKET_CLOSE, MARKET_OPEN, at, from_epoch, minute_of_session, parse_hms, phase
 from ..universe_data import SECTOR_OF
 from ..analytics import alerts as alerts_mod
@@ -40,6 +41,15 @@ from ..analytics.state import InstState, safe
 
 log = logging.getLogger("td.analytics")
 LOCK_GRACE_S = 600      # picks may lock up to 10 minutes after LOCK_TIME (e.g. a slow start), never later
+NO_TRADING_FRACTION = 0.2   # fewer stocks than this moved → nothing traded (closure or dead feed): no lock, no card
+TARGET_ATR = 1.0        # pick target, in 14-day ATRs from the entry
+STOP_ATR = 0.6          # the stop (opening-range low/high) is never further than this
+
+
+def _hm(minute: int) -> str:
+    """Session minute (0 = 09:15) → 'HH:MM' IST."""
+    t = 9 * 60 + 15 + int(minute)
+    return f"{t // 60:02d}:{t % 60:02d}"
 
 
 class Engine:
@@ -316,7 +326,7 @@ class Engine:
 
     async def maybe_lock(self):
         dt = from_epoch(self.clock)
-        if self.top.get("locked") or self.top.get("missed") or phase(dt) != "OPEN" \
+        if self.top.get("locked") or self.top.get("missed") or self.top.get("closed") or phase(dt) != "OPEN" \
                 or dt.timetz().replace(tzinfo=None) < self.lock_t:
             return
         # a lock taken long after LOCK_TIME would not be the 09:30 strategy — skip the day instead
@@ -328,6 +338,16 @@ class Engine:
                         settings.lock_time)
             return
         if not self.rows:
+            return
+        # a closure missing from the holiday list (or a dead feed): every price still sits at yesterday's close —
+        # picks from frozen prices would be noise and their scorecard a fake day
+        priced = [s for s in self.eqs if s.ltp and s.pc]
+        moved = sum(1 for s in priced if abs(s.ltp - s.pc) > 1e-6)
+        if priced and moved < NO_TRADING_FRACTION * len(priced):
+            self.top = {"locked": False, "date": dt.date().isoformat(),
+                        "closed": "no trading — prices have not moved from yesterday's close (NSE closed or no feed)"}
+            log.warning("no lock today: only %d of %d stocks moved from the previous close by %s", moved, len(priced),
+                        settings.lock_time)
             return
         longs = intraday.pick(self.rows, self.cfg, "long")
         shorts = intraday.pick(self.rows, self.cfg, "short")
@@ -355,12 +375,16 @@ class Engine:
         s = self.eq_by_symbol[r["symbol"]]
         atr = r["atr"] or s.ltp * 0.02
         entry = r["ltp"]
+        # stop: the opening-range low/high, but never further than STOP_ATR (the target is TARGET_ATR away), so a
+        # wide first 15 minutes can't leave a pick risking more than it can make
         if side == "long":
-            inval = r["orl"] if r["orl"] and r["orl"] < entry else entry - 0.6 * atr
-            tgt = entry + 1.0 * atr
+            cap = entry - STOP_ATR * atr
+            inval = max(r["orl"], cap) if r["orl"] and r["orl"] < entry else cap
+            tgt = entry + TARGET_ATR * atr
         else:
-            inval = r["orh"] if r["orh"] and r["orh"] > entry else entry + 0.6 * atr
-            tgt = entry - 1.0 * atr
+            cap = entry + STOP_ATR * atr
+            inval = min(r["orh"], cap) if r["orh"] and r["orh"] > entry else cap
+            tgt = entry - TARGET_ATR * atr
         return {"sid": r["sid"], "symbol": r["symbol"], "sector": r["sector"], "entry": entry,
                 "score": r["score"] if side == "long" else r["score_s"], "chips": intraday.factor_chips(r, side),
                 "f": r["f"], "rvol": r["rvol"], "gap": r["gap"], "chg_at_lock": r["chg"], "headline": r["headline"],
@@ -383,17 +407,20 @@ class Engine:
                                         else ((1 - s.min_since_lock / p["entry"]) * 100))
                         q["mae"] = safe(((s.min_since_lock / p["entry"] - 1) * 100) if side == "long"
                                         else ((1 - s.max_since_lock / p["entry"]) * 100))
-                        q["status"] = ("TARGET" if (sgn * (s.ltp - p["target"]) >= 0) else
-                                       "INVALID" if (sgn * (s.ltp - p["invalidation"]) <= 0) else "LIVE")
+                        q["status"], q["hit_at"] = self._outcome(s, p, side)
                         q["spark"] = [b[3] for _, b in sorted(s.bars.items())][-90:]
                     live.append(q)
                 out[side] = live
             # how the picks rank vs everything since the lock
             out["universe_since_lock"] = self._since_lock_stats()
             return out
+        dt = from_epoch(self.clock)
+        closed = holiday_name(dt.date()) or self.top.get("closed")
+        if closed:
+            return {"locked": False, "provisional": False, "closed": closed, "lock_time": settings.lock_time,
+                    "long": [], "short": []}
         longs = intraday.pick(self.rows, self.cfg, "long") if self.rows else []
         shorts = intraday.pick(self.rows, self.cfg, "short") if self.rows else []
-        dt = from_epoch(self.clock)
         lock_dt = datetime.combine(dt.date(), self.lock_t, tzinfo=IST)
         def prov(r: dict, side: str) -> dict:
             s = self.eq_by_symbol.get(r["symbol"])
@@ -405,6 +432,31 @@ class Engine:
                 "seconds_to_lock": max(0, int((lock_dt - dt).total_seconds())),
                 "long": [prov(r, "long") for r in longs],
                 "short": [prov(r, "short") for r in shorts]}
+
+    def _outcome(self, s: InstState, p: dict, side: str) -> tuple[str, str | None]:
+        """TARGET / INVALID / LIVE and the IST minute it happened. The first level the price touched after the
+        lock decides, and it stays decided: a stop that was hit doesn't turn LIVE again when the price comes back.
+        Minute bars carry the path (a minute that touched both counts as INVALID); max/min since the lock cover
+        a pick whose bars are missing."""
+        sgn = 1 if side == "long" else -1
+        tgt, inv = p["target"], p["invalidation"]
+        lock_m = minute_of_session(from_epoch(self.top.get("lock_ts") or self.clock))
+        for m, (o, h, l, c, v) in sorted(s.bars.items()):
+            if m < lock_m:
+                continue
+            best, worst = (h, l) if side == "long" else (l, h)
+            if sgn * (worst - inv) <= 0:
+                return "INVALID", _hm(m)
+            if sgn * (best - tgt) >= 0:
+                return "TARGET", _hm(m)
+        if s.lock_px:
+            best, worst = ((s.max_since_lock, s.min_since_lock) if side == "long"
+                           else (s.min_since_lock, s.max_since_lock))
+            if worst and sgn * (worst - inv) <= 0:
+                return "INVALID", None
+            if best and sgn * (best - tgt) >= 0:
+                return "TARGET", None
+        return "LIVE", None
 
     def _since_lock_stats(self) -> dict:
         rets = [(s.symbol, (s.ltp / s.lock_px - 1) * 100) for s in self.eqs if s.lock_px and s.ltp]
@@ -432,6 +484,14 @@ class Engine:
         if self.scorecard_done or not self.top.get("locked"):
             return
         if dt.timetz().replace(tzinfo=None) < MARKET_CLOSE:
+            return
+        locked = [s for s in self.eqs if s.lock_px and s.ltp]
+        moved = sum(1 for s in locked if abs(s.ltp - s.lock_px) > 1e-6)
+        if not locked or moved < NO_TRADING_FRACTION * len(locked):
+            # nothing traded after the lock (a closure the holiday list missed, or the feed died): not a day to score
+            self.scorecard_done = True
+            log.warning("no scorecard for %s: only %d of %d stocks moved after the lock", dt.date(), moved,
+                        len(locked))
             return
         st = self._since_lock_stats()
         scores = self.top.get("lock_scores", {})

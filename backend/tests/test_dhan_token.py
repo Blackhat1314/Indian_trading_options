@@ -57,6 +57,7 @@ class FakeDhan:
         self.calls: list[str] = []
         self.issued: list[str] = []
         self.renew_status = 200
+        self.renew_body: dict | None = None    # what a refused RenewToken answers (default: DH-901)
         self.gen_fail = 0              # how many generate calls fail before one succeeds
         self.gen_status = 400
         self.reject_new = False        # newly issued tokens fail /profile
@@ -88,7 +89,8 @@ class FakeDhan:
             await asyncio.sleep(self.delay)
             assert req.headers.get("dhanClientId") == CID
             if tok not in self.valid or self.renew_status != 200:
-                return httpx.Response(self.renew_status if self.renew_status != 200 else 401, json=bad)
+                return httpx.Response(self.renew_status if self.renew_status != 200 else 401,
+                                      json=self.renew_body or bad)
             self.valid.discard(tok)
             new = self.issue()
             return httpx.Response(200, json={"dhanClientId": CID, "dhanClientName": "X", "accessToken": new,
@@ -356,6 +358,44 @@ def test_token_dhan_will_not_renew_is_replaced_by_a_totp_login():
         assert dhan.calls.count("RenewToken") == 2 and dhan.calls.count("generateAccessToken") == 1
         assert settings.dhan_access_token == dhan.issued[-1] and k.current["source"] == "totp"
         assert k.view["state"] == "valid" and not k.view["last_error"]
+    asyncio.run(go())
+
+
+TOTP_TOKEN_REFUSED = {"errorCode": "INVALID_REQUEST", "errorMessage": "Renewal of token not allowed for this token type"}
+
+
+@pytest.mark.parametrize("body", [{"errorType": "Input_Exception", "errorCode": "DH-905",     # as Dhan sends it
+                                   "errorMessage": json.dumps(TOTP_TOKEN_REFUSED, separators=(",", ":"))},
+                                  TOTP_TOKEN_REFUSED])
+def test_dh905_from_a_totp_token_logs_in_at_once(body):
+    """Dhan answers RenewToken for a token from a TOTP login with HTTP 500 + DH-905. That is a final no, not a
+    hiccup: the keeper logs in with the PIN + TOTP in the same step instead of retrying until the token lapses."""
+    async def go():
+        clock = [T(8, 31)]
+        old = jwt(T(17), T(17, 0, -1))                           # made by a TOTP login yesterday 17:00
+        r, dhan, k = setup(clock, env=old)
+        dhan.valid.add(old)
+        dhan.renew_status, dhan.renew_body = 500, body
+        settings.dhan_pin, settings.dhan_totp_secret = "4321", SECRET
+        await k._pick()
+        await k.step()                                            # 08:31: inside the morning window
+        assert dhan.calls.count("RenewToken") == 1 and dhan.calls.count("generateAccessToken") == 1
+        assert settings.dhan_access_token == dhan.issued[-1] and k.current["source"] == "totp"
+        assert not k.view["last_error"] and k.view["state"] == "valid"
+    asyncio.run(go())
+
+
+def test_dh905_without_totp_says_what_to_do():
+    async def go():
+        clock = [T(8, 31)]
+        old = jwt(T(17), T(17, 0, -1))
+        r, dhan, k = setup(clock, env=old)
+        dhan.valid.add(old)
+        dhan.renew_status, dhan.renew_body = 500, TOTP_TOKEN_REFUSED
+        await k._pick()
+        await k.step()
+        assert "generateAccessToken" not in dhan.calls and settings.dhan_access_token == old
+        assert "DHAN_TOTP_SECRET" in k.view["last_error"]
     asyncio.run(go())
 
 

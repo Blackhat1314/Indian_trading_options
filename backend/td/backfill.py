@@ -30,6 +30,7 @@ from .config import settings
 from .dhan.rest import DhanError
 from .lake import Lake, bars_from_dhan
 from .ratelimit import BudgetExhausted
+from .timeutil import IST
 
 log = logging.getLogger("td.backfill")
 
@@ -39,7 +40,9 @@ INTRADAY_CHUNK_DAYS = 90       # Dhan: max 90 days per intraday request
 DAILY_CHUNK_DAYS = 3660       # one daily request returns 10+ years (no documented cap): 1 call per symbol
 INTRADAY_MAX_YEARS = 5         # Dhan keeps 5 years of intraday bars
 MAX_ATTEMPTS = 4               # per request, for rate-limit / network errors (then it is reported as failed)
-EMPTY_OK_DAYS = 14             # a bar-less 200 for a longer range is suspicious: not recorded as covered
+EMPTY_OK_DAYS = 14             # a bar-less 200 for a longer range is suspicious: not recorded as covered...
+HISTORY_SLACK_DAYS = 4         # ...unless it ends (within a long weekend) where the stock's history begins
+ARCHIVE_EDGE_DAYS = 120        # Dhan's 5-year intraday archive starts somewhere in these oldest days of the window
 TEST_SYMBOL = re.compile(r"NSETEST$")          # exchange test scrips Dhan lists among the F&O underlyings
 AUTH_CODES = {"806", "807", "808", "809", "810", "DH-901", "DH-902", "DH-903"}
 RATE_CODES = {"805", "DH-904", "RL001"}
@@ -167,9 +170,11 @@ def coverage_from_state(st: dict, today: date) -> Coverage:
 
 
 def make_jobs(tgts: list[Target], intervals: list[str], years: float, today: date, cov: Coverage | None = None,
-              since: dict[tuple[str, str], date] | None = None, recent: bool = False) -> list[Job]:
+              since: dict[tuple[str, str], date] | None = None, recent: bool = False,
+              floor: dict[str, date] | None = None) -> list[Job]:
     """Requests for [today - years, end), newest chunk first, symbols interleaved; with `cov`, ranges already
-    covered are skipped and partly covered chunks shrink to the part still missing.
+    covered are skipped and partly covered chunks shrink to the part still missing. `floor` (listing_floor)
+    starts each listed-later stock at its first trading day: Dhan has nothing before it.
 
     `end` is the settled boundary (the day before yesterday, inclusive): the live app's auto-history keeps the
     last few days current, so a finished pull plans nothing. `recent=True` (CLI `update`) runs through today."""
@@ -192,12 +197,71 @@ def make_jobs(tgts: list[Target], intervals: list[str], years: float, today: dat
                 lo = s
                 if since and (iv, t.symbol) in since:
                     lo = max(lo, since[(iv, t.symbol)])
+                if floor and t.symbol in floor:
+                    lo = max(lo, floor[t.symbol])
                 if lo >= e:
                     continue
                 rng = (lo, e) if cov is None else cov.missing(iv, t.symbol, lo, e)
                 if rng:
                     jobs.append(Job(t.symbol, t.sid, t.seg, t.instrument, iv, rng[0].isoformat(), rng[1].isoformat()))
     return jobs
+
+
+def _ist_day(ts: int | float) -> date:
+    return datetime.fromtimestamp(ts, tz=IST).date()
+
+
+def _daily_asked_from(st: dict, symbol: str) -> date | None:
+    """Earliest day a finished daily request for `symbol` covered (done or empty)."""
+    out = None
+    pre = f"D|{symbol}|"
+    for bucket in ("done", "empty"):
+        for key in st.get(bucket, {}):
+            if key.startswith(pre):
+                p = parse_key(key)
+                if p and (out is None or p[2] < out):
+                    out = p[2]
+    return out
+
+
+def listing_day(first_daily: date | None, asked_from: date | None) -> date | None:
+    """The listing day, when daily bars begin well after the earliest day a finished daily request asked Dhan for:
+    Dhan's daily history goes back 10+ years, so that first bar is when the stock started trading."""
+    if first_daily and asked_from and asked_from <= first_daily - timedelta(days=HISTORY_SLACK_DAYS):
+        return first_daily
+    return None
+
+
+def listing_floor(st: dict, lake: Lake, today: date) -> dict[str, date]:
+    """listing_day for every stock the lake and the state can prove it for (DELHIVERY 2022, SWIGGY 2024 …):
+    no intraday request before it can return anything."""
+    cov = coverage_from_state(st, today)
+    out: dict[str, date] = {}
+    for c in lake.coverage():
+        if c["interval"] != "D":
+            continue
+        rs = cov.ranges.get(("D", c["symbol"]))
+        day = listing_day(_ist_day(c["first"]), rs[0][0] if rs else None)
+        if day:
+            out[c["symbol"]] = day
+    return out
+
+
+def history_start(job: Job, first_bar: date | None, listed: date | None, today: date) -> date | None:
+    """An empty answer for `job` that only means the stock has no bars that far back, or None (then a long empty
+    range is a real failure, retried next run). Two cases end where the stock's history begins:
+      listed      the range is before its listing day (listing_floor) — certain;
+      first_bar   an intraday range in the oldest months of the 5-year window that ends where the bars already in
+                  the lake begin: Dhan's intraday archive runs out there for this stock. Elsewhere in the window an
+                  empty answer for a stock that was trading is suspicious, so it stays a failure."""
+    end = date.fromisoformat(job.end)                     # exclusive
+    if listed and end <= listed + timedelta(days=HISTORY_SLACK_DAYS):
+        return listed
+    horizon = today - timedelta(days=int(365.25 * INTRADAY_MAX_YEARS)) + timedelta(days=ARCHIVE_EDGE_DAYS)
+    if (job.interval != "D" and first_bar and end <= first_bar + timedelta(days=HISTORY_SLACK_DAYS)
+            and date.fromisoformat(job.start) <= horizon):
+        return first_bar
+    return None
 
 
 def summarize(jobs: list[Job], budget_left: int | None = None, reserve: int = 0, rate: float = 3.0) -> dict:
@@ -294,6 +358,7 @@ class Progress:
     done: int = 0
     ok: int = 0
     empty: int = 0
+    before_history: int = 0                             # empty because the stock has no bars that far back
     failed: int = 0
     retried: int = 0
     rows: int = 0
@@ -404,8 +469,21 @@ async def run_jobs(jobs: list[Job], rest, lake: Lake, st: dict, *, today: date, 
     reason: list[str] = []
     ended = asyncio.Event()                 # set with the first reason: wakes workers parked in a paused gate
     st["failed"] = {}
+    try:
+        listed = listing_floor(st, lake, today)
+    except Exception as e:                   # an unreadable lake file must not stop the pull
+        log.debug("listing dates unavailable: %s", e)
+        listed = {}
     if on_progress:
         on_progress(prog)                    # totals are known before the first request (which may wait on a gate)
+
+    async def before_history(job: Job) -> date | None:
+        day = listed.get(job.symbol)
+        if day is None:                      # a daily request of this run may have just shown the listing day
+            d_ts = await asyncio.to_thread(lake.first_ts, "D", job.symbol)
+            day = listing_day(_ist_day(d_ts) if d_ts else None, _daily_asked_from(st, job.symbol))
+        ts = await asyncio.to_thread(lake.first_ts, LAKE_NAME[job.interval], job.symbol)
+        return history_start(job, _ist_day(ts) if ts else None, day, today)
 
     def finish(job: Job) -> None:
         prog.done += 1
@@ -451,7 +529,15 @@ async def run_jobs(jobs: list[Job], rest, lake: Lake, st: dict, *, today: date, 
             prog.current = job.label
             try:
                 df = bars_from_dhan(await fetch(rest, job))
-                if df.empty and (date.fromisoformat(job.end) - date.fromisoformat(job.start)).days > EMPTY_OK_DAYS:
+                long_range = (date.fromisoformat(job.end) - date.fromisoformat(job.start)).days > EMPTY_OK_DAYS
+                hs = await before_history(job) if df.empty and long_range else None
+                if hs:
+                    # listed later, or older than Dhan keeps: nothing to retry, so record it as covered
+                    record(st, "empty", job, 1, today)
+                    prog.empty += 1
+                    prog.before_history += 1
+                    log.debug("%s: none — %s's history starts %s", job.label, job.symbol, hs)
+                elif df.empty and long_range:
                     fail(job, "empty response for a long range (retried next run)")
                 elif df.empty:
                     record(st, "empty", job, 1, today)

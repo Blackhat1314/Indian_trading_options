@@ -231,6 +231,17 @@ def _error_text(status: int, body: Any, text: str) -> str:
     return f"HTTP {status} {text.strip()[:200]}".strip()
 
 
+def _renew_refused(body: Any) -> bool:
+    """Dhan saying RenewToken will never work for this token — DH-905 "Renewal of token not allowed for this token
+    type" (tokens from a PIN + TOTP login). It comes as HTTP 500, so _unsure alone would take it for a hiccup and
+    retry every 5 minutes until the token expires."""
+    if not isinstance(body, dict):
+        return False
+    code = str(body.get("errorCode") or "")
+    msg = str(body.get("errorMessage") or body.get("message") or "").lower()
+    return code == "DH-905" or "renewal of token not allowed" in msg
+
+
 def _unsure(status: int | None, body: Any) -> bool:
     """A failure that says nothing about the token: network, rate limit, Dhan down, or no such route (a wrong
     DHAN_BASE_URL, the mock server). Any other 4xx is Dhan refusing it."""
@@ -689,7 +700,8 @@ class TokenKeeper:
             now = self.clock()
             if not new:
                 err = err or "Dhan's answer had no token"
-                if st is not None and st >= 400 and not _unsure(st, body):
+                refused = _renew_refused(body)
+                if st is not None and st >= 400 and (refused or not _unsure(st, body)):
                     ok, _, perr = await self._profile(tok)
                     if ok is False:
                         msg = f"Dhan rejected the token: {perr}"
@@ -700,6 +712,9 @@ class TokenKeeper:
                         log.info("Dhan did not renew the token (%s) — logging in with the PIN + TOTP instead", err)
                         return await self._login()
                 msg = f"Renewal failed: {err}"
+                if refused and not totp_configured():
+                    msg += (" — Dhan doesn't renew tokens made with a PIN + TOTP login: set DHAN_PIN and "
+                            "DHAN_TOTP_SECRET so a new one is made each morning, or paste a fresh token in time")
                 log.warning(msg)
                 await self._note(retry_at=now + RETRY_AFTER, last_error=msg, error_op="renew")
                 return False, msg, 502 if _unsure(st, body) else 400

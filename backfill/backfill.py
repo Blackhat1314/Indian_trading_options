@@ -64,7 +64,8 @@ def _jobs(universe: Universe, intervals: list[str], years: float, symbols: set[s
     today = now_ist().date()
     st = bf.compact(bf.load_state(), today)
     return bf.make_jobs(bf.targets(universe.instruments, symbols), intervals, years, today,
-                        bf.coverage_from_state(st, today), since, recent=since is not None)
+                        bf.coverage_from_state(st, today), since, recent=since is not None,
+                        floor=bf.listing_floor(st, _lake(), today))
 
 
 class _Session:

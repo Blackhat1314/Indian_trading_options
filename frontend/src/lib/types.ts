@@ -50,11 +50,11 @@ export interface Pick {
   sid: number; symbol: string; sector: string; entry: number; score: number; chips: string[]; f: Factors;
   rvol: number; gap: number; chg_at_lock: number; headline: string | null; invalidation: number; target: number;
   oi_tag: string; ltp?: number; chg?: number; pnl?: number; mfe?: number; mae?: number; status?: string;
-  spark?: number[];
+  hit_at?: string | null; spark?: number[];
 }
 
 export interface TopSnap {
-  locked: boolean; provisional?: boolean; missed?: boolean; date?: string; lock_ts?: number; lock_time: string;
+  locked: boolean; provisional?: boolean; missed?: boolean; closed?: string; date?: string; lock_ts?: number; lock_time: string;
   seconds_to_lock?: number; long: Pick[]; short: Pick[];
   abstained?: { long: number; short: number };
   universe_since_lock?: {

@@ -40,8 +40,9 @@ def at(d: date, t: time) -> datetime:
 
 
 def phase(dt: datetime) -> str:
-    """Return the NSE session phase for an IST datetime."""
-    if dt.weekday() >= 5:
+    """Return the NSE session phase for an IST datetime (CLOSED all day on weekends and NSE holidays)."""
+    from .holidays import is_holiday
+    if dt.weekday() >= 5 or is_holiday(dt.date()):
         return "CLOSED"
     t = dt.timetz().replace(tzinfo=None)
     if t < PRE_OPEN_START:
