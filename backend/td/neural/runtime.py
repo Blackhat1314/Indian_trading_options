@@ -35,6 +35,8 @@ from . import news as nw
 log = logging.getLogger("td.neural.runtime")
 
 MODEL_NAME, MODEL_VERSION = "NeuralEdge", 1
+# the network inputs the NEURAL shell draws for a stock: 40-day paths of these technical features (z-scores)
+TRACE_KEYS = ("mom_21", "vol_regime", "kalman_t", "rsi", "volume_z", "resid_mom")
 FUND_MAX_AGE_S = 3 * 86400        # fundamentals older than this are refetched in the background
 CHECK_FILES_S = 30.0
 PREDICT_TTL_S = 600.0
@@ -152,6 +154,24 @@ class NeuralService:
         out["top"], out["bottom"] = (pick(rows[:n]), pick(rows[::-1][:n])) if edge else ([], [])
         return out
 
+    async def universe(self, h: int) -> dict:
+        """Every scored stock at one horizon — the NEURAL shell's particles."""
+        info = await self.info()
+        if info["status"] in ("missing", "error"):
+            return {"model": {"status": info["status"]}, "h": h, "rows": []}
+        p = await self._predictions(wait=False)
+        if p is None:
+            return {"model": {"status": "computing"}, "h": h, "rows": [], "computing": True}
+        hz = self._horizon(h)
+        rm = ((hz.get("rank") or {}).get("metrics") or {}).get("neural") or {}
+        um = hz["metrics"]["neural"]
+        rows = [{"symbol": r["symbol"], "sector": r["sector"], "p_up": r["p"][str(h)],
+                 "p_beat": (r.get("pb") or {}).get(str(h))} for r in p["rows"].values()]
+        return {"model": {"status": "ready"}, "h": h, "as_of": p["as_of"], "rows": rows,
+                "edge": bool(um.get("edge")), "rank_edge": bool(rm.get("edge")),
+                "base_up": (hz.get("calibration") or {}).get("base"),
+                "base_beat": ((hz.get("rank") or {}).get("calibration") or {}).get("base")}
+
     async def result(self, symbol: str) -> dict:
         info = await self.info()
         if info["status"] in ("missing", "error"):
@@ -175,7 +195,8 @@ class NeuralService:
                        "rank_verdict": (hz.get("rank") or {}).get("verdict"),
                        "rank_pct": r["rank"][str(h)] if (edge or rank_edge) else None})
         return {"symbol": r["symbol"], "status": "ready", "as_of": p["as_of"], "close": r["close"],
-                "sector": r["sector"], "horizons": hs, "inputs": r["inputs"], "model": info}
+                "sector": r["sector"], "horizons": hs, "inputs": r["inputs"], "trace": r.get("trace"),
+                "groups": r.get("groups"), "model": info}
 
     def intraday_info(self) -> dict:
         """The 09:30 model's report card from data/neural/intraday.json (the analytics worker runs it)."""
@@ -300,6 +321,8 @@ class NeuralService:
                 order = np.argsort(np.argsort(-key))
                 ranks[hz["h"]] = 100.0 * (1 - order / max(P.rows - 1, 1))
             fund_cols = {k: meta["static_keys"].index(f"has_{k}") for k in meta["fund_keys"]}
+            seq_all = P.seq(idx)
+            tk = [ds.TECH_KEYS.index(k) for k in TRACE_KEYS]
             for i in range(P.rows):
                 sym = P.syms[P.row_sym[i]]
                 rows[sym] = {"symbol": sym, "sector": _sector(meta, P, i), "close": _f(P.close[i], 2),
@@ -309,7 +332,10 @@ class NeuralService:
                              "rank": {str(h): _f(v[i], 1) for h, v in ranks.items()},
                              "inputs": {"fundamentals": int(sum(P.static[i, c] for c in fund_cols.values())),
                                         "fundamentals_of": len(fund_cols),
-                                        "news_on": bool(P.static[i, meta["static_keys"].index("news_on")])}}
+                                        "news_on": bool(P.static[i, meta["static_keys"].index("news_on")])},
+                             "trace": {"keys": list(TRACE_KEYS), "labels": [qm.FEATURE_LABEL[k] for k in TRACE_KEYS],
+                                       "z": [[round(float(v), 2) for v in seq_all[i, :, j]] for j in tk]},
+                             "groups": _groups(meta["static_keys"], P.static[i])}
             as_of = ds.date_of(int(max(P.row_ts))) if P.rows else None
             self._pred = {"at": time.time(), "as_of": as_of, "rows": rows}
             self._progress, self._message = 1.0, "ready"
@@ -340,6 +366,24 @@ class NeuralService:
             log.info("NeuralEdge: fundamentals refreshed for %d/%d stocks", got, len(todo))
             self._pred = None                            # next request recomputes with them
         self._fund_task = asyncio.create_task(run(), name="neural-fundamentals")
+
+
+def _groups(keys: list[str], row: np.ndarray) -> dict:
+    """The stock's static inputs as the network saw them, by kind: cross-sectional ranks (−1 … +1), fundamentals
+    (rank among stocks, None when unknown), the 1-minute day summaries and the news."""
+    from . import fundamentals as fu
+    v = dict(zip(keys, (float(x) for x in row)))
+    out = {"ranks": [{"key": k, "label": qm.FEATURE_LABEL.get(k[3:], k[3:]), "v": round(v[k], 3)}
+                     for k in keys if k.startswith("cs_") and not k.startswith("cs_m_")],
+           "fundamentals": [{"key": k, "label": fu.FUND_LABEL.get(k, k),
+                             "v": round(v[f"f_{k}"], 3) if v.get(f"has_{k}") else None}
+                            for k in fu.FUND_KEYS if f"f_{k}" in v],
+           "news": {k: round(v[k], 3) for k in nw.NEWS_KEYS if k in v}}
+    if "m_on" in v:
+        out["minute"] = {"on": bool(v["m_on"]), "items": [
+            {"key": k, "label": mn.DAY_LABEL.get(k, k), "v": round(v[f"cs_{k}"], 3) if v["m_on"] else None}
+            for k in mn.DAY_KEYS if f"cs_{k}" in v]}
+    return out
 
 
 def recent_tables(data, syms: list[str], days: int = 3) -> dict:

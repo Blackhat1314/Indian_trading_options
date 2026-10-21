@@ -17,6 +17,7 @@ import { research } from "../lib/research";
 import type { NeuralInfo, NeuralIntradayInfo, NeuralLeaderboard, NeuralLeader, NeuralMetric, NeuralResult } from "../lib/research";
 import { useLive } from "../lib/store";
 import type { Pick } from "../lib/types";
+import { NeuralShell } from "../components/neural/NeuralShell";
 import "./neural.css";
 
 const H_SHORT: Record<number, string> = { 1: "1D", 5: "1W", 21: "1M" };
@@ -444,11 +445,16 @@ export default function Neural() {
   const board = useLoad<NeuralLeaderboard | null>(() => (ready ? research.neuralLeaderboard(Number(lbH), 15) : Promise.resolve(null)),
     [lbH, ready], (r) => !!r?.computing);
   const intra = useLoad(() => research.neuralIntraday(), []);
+  const universe = useLoad(() => (ready ? research.neuralUniverse(Number(lbH)) : Promise.resolve(null)), [lbH, ready],
+    (r) => !!r?.computing);
+  const neuralTop = useLive((s) => s.top?.neural);
   return (
     <div className="desk desk-neural rs-desk">
       <SymbolPicker area="pick" actions={
-        <button type="button" className="btn" onClick={() => { info.reload(); res.reload(); board.reload(); intra.reload(); }} title="Reload the model status and forecasts">REFRESH</button>
+        <button type="button" className="btn" onClick={() => { info.reload(); res.reload(); board.reload(); intra.reload(); universe.reload(); }} title="Reload the model status and forecasts">REFRESH</button>
       } />
+      {ready && <NeuralShell h={lbH} setH={setLbH} universe={universe.data} result={res.data} neural={neuralTop}
+        symbol={symbol} onPick={setResearchSymbol} />}
       {!ready ? <SetupPanel info={info.data} /> : <CallPanel r={res.data} loading={res.loading} error={res.error} reload={res.reload} />}
       <QualityPanel info={ready ? info.data : null} error={info.error} />
       {ready && <LeaderboardPanel h={lbH} setH={setLbH} b={board.data} loading={board.loading} error={board.error} reload={board.reload} sel={symbol} onPick={setResearchSymbol} />}

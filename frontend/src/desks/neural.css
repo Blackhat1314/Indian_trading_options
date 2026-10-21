@@ -3,9 +3,10 @@
 .desk-neural {
   overflow-y: auto; align-content: start;
   grid-template-columns: minmax(0, 1.15fr) minmax(360px, 1fr);
-  grid-template-rows: repeat(5, max-content);
+  grid-template-rows: repeat(6, max-content);
   grid-template-areas:
     "pick    pick"
+    "shell   shell"
     "call    quality"
     "lead    quality"
     "intra   iq"
@@ -50,6 +51,89 @@
 .nn-status.TARGET { color: var(--up); }
 .nn-status.INVALID { color: var(--down); }
 @media (max-width: 1180px) {
-  .desk-neural { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pick" "call" "quality" "lead" "intra" "iq" "disc"; }
+  .desk-neural { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pick" "shell" "call" "quality" "lead" "intra" "iq" "disc"; }
   .nn-cards, .nn-lead-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ------------------------------------------------------------------ the neural shell */
+.shell { overflow: hidden; }
+.shell .panel-actions { display: flex; gap: 8px; align-items: center; }
+.shell-grid {
+  position: relative; display: grid; gap: 14px; padding: 10px 12px 6px;
+  grid-template-columns: 220px minmax(0, 1fr) 230px; min-height: 470px;
+  background:
+    radial-gradient(ellipse 60% 70% at 50% 50%, rgba(69, 211, 242, 0.07), transparent 70%),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 3px);
+}
+.shell-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+.wire path { fill: none; vector-effect: non-scaling-stroke; }
+.wire .wire-base { stroke-width: 1; stroke-opacity: 0.35; }
+.wire .wire-flow { stroke-width: 1.6; stroke-dasharray: 2 14; stroke-linecap: round; animation: shell-flow linear infinite; }
+.wire.pos path { stroke: var(--cyan); }
+.wire.neg path { stroke: var(--down); }
+.wire.violet path { stroke: var(--violet); }
+.wire.amber path { stroke: var(--amber); }
+.wire.mute path { stroke: var(--muted); }
+.wire.mute .wire-flow { animation: none; stroke-opacity: 0; }
+@keyframes shell-flow { to { stroke-dashoffset: -32; } }
+.shell-in, .shell-out { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.shell-col-head { font-size: 11px; color: var(--muted); padding: 0 2px 2px; }
+.shell-col-head b { color: var(--text); font-weight: 600; }
+.shell-card {
+  display: block; width: 100%; text-align: left; padding: 6px 8px; min-width: 0;
+  background: rgba(9, 13, 19, 0.88); border: 1px solid var(--border); border-left: 2px solid var(--border-2);
+  border-radius: var(--r); backdrop-filter: blur(2px);
+}
+.shell-in .shell-card:has(.cyan) { border-left-color: rgba(69, 211, 242, 0.7); }
+.shell-in .shell-card:has(.down) { border-left-color: rgba(255, 82, 99, 0.7); }
+.shell-in .shell-card:has(.violet) { border-left-color: rgba(167, 139, 250, 0.7); }
+.shell-card.out { cursor: pointer; color: inherit; }
+.shell-card.out:hover { background: var(--hover); }
+.shell-card.out.on { border-color: rgba(69, 211, 242, 0.55); box-shadow: 0 0 0 1px rgba(69, 211, 242, 0.18), 0 0 18px rgba(69, 211, 242, 0.12); }
+.shell-card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11.5px; color: var(--text-2); }
+.shell-card-top b { font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.shell-card-sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.violet { color: var(--violet); }
+.shell-trace { display: block; width: 100%; height: 26px; margin-top: 3px; }
+.shell-zero { stroke: var(--border-2); stroke-width: 1; stroke-dasharray: 2 3; vector-effect: non-scaling-stroke; }
+.shell-bars { display: flex; align-items: flex-end; gap: 3px; height: 26px; margin-top: 4px; }
+.shell-bars i { flex: 1; background: var(--violet); opacity: 0.85; border-radius: 1px 1px 0 0; }
+.shell-bars i.off { background: var(--border-2); opacity: 1; }
+.shell-out-vals { display: flex; gap: 14px; margin-top: 4px; }
+.shell-out-vals span { display: flex; flex-direction: column; }
+.shell-out-vals small { font-size: 10.5px; color: var(--muted); }
+.shell-out-vals b { font-family: var(--font-mono); font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.shell-picks { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 2px; }
+.shell-picks li { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 11.5px; }
+.shell-picks button { background: none; border: 0; padding: 0; color: var(--text); font: inherit; }
+.shell-picks button.amber { color: var(--amber); }
+.shell-picks button.magenta { color: #ff5cbe; }
+.shell-picks button:hover { text-decoration: underline; }
+.shell-core { position: relative; z-index: 1; min-width: 0; min-height: 440px; }
+.shell-canvas { position: absolute; inset: 0; }
+.shell-canvas canvas { display: block; }
+.shell-tip {
+  position: absolute; z-index: 3; pointer-events: none; padding: 5px 8px; font-size: 11.5px; width: max-content; max-width: 220px;
+  background: rgba(5, 7, 11, 0.94); border: 1px solid var(--border-2); border-radius: var(--r);
+}
+.shell-legend { position: absolute; left: 4px; bottom: 2px; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 10.5px; color: var(--muted); }
+.shell-legend .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: -0.5px; }
+.dot.pos { background: var(--cyan); } .dot.neg { background: var(--down); } .dot.amber { background: var(--amber); } .dot.magenta { background: #ff5cbe; }
+.shell-empty { margin: 8px 2px; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+.shell-empty.center { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; margin: 0; }
+.shell-hist { padding: 4px 12px 10px; }
+.shell-hist-bars { position: relative; display: flex; align-items: flex-end; gap: 2px; height: 38px; border-bottom: 1px solid var(--border); }
+.shell-hist-bars i { flex: 1; min-height: 1px; border-radius: 1px 1px 0 0; }
+.shell-hist-bars i.pos { background: rgba(69, 211, 242, 0.65); }
+.shell-hist-bars i.neg { background: rgba(255, 82, 99, 0.55); }
+.shell-mark { position: absolute; top: -4px; bottom: -3px; width: 0; border-left: 1px dashed var(--text-2); }
+.shell-mark.sel { border-left: 2px solid #fff; }
+.shell-hist-axis { display: flex; justify-content: space-between; gap: 10px; font-size: 10.5px; color: var(--muted); margin-top: 3px; font-family: var(--font-mono); }
+@media (prefers-reduced-motion: reduce) { .wire .wire-flow { animation: none; } }
+@media (max-width: 1180px) {
+  .shell-grid { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .shell-wires { display: none; }
+  .shell-core { order: -1; min-height: 340px; }
+  .shell-in, .shell-out { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  .shell-col-head { grid-column: 1 / -1; }
 }

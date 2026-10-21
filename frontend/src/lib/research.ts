@@ -186,6 +186,19 @@ export interface NeuralResult {
                oos_auc: number | null; verdict: string; rank_pct: number | null; p_beat?: number | null;
                rank_edge?: boolean; rank_note?: string | null; oos_ic?: number | null; rank_verdict?: string | null }[];
   inputs?: { fundamentals: number; fundamentals_of: number; news_on: boolean };
+  // the network's own inputs for this stock (the NEURAL shell's wires)
+  trace?: { keys: string[]; labels: string[]; z: number[][] } | null;
+  groups?: {
+    ranks: { key: string; label: string; v: number }[];
+    fundamentals: { key: string; label: string; v: number | null }[];
+    news: { news_n?: number; news_sent?: number; news_on?: number };
+    minute?: { on: boolean; items: { key: string; label: string; v: number | null }[] };
+  } | null;
+}
+export interface NeuralUniverseRow { symbol: string; sector: string; p_up: number | null; p_beat: number | null }
+export interface NeuralUniverse {
+  model: { status: string }; h: number; as_of?: string; rows: NeuralUniverseRow[]; computing?: boolean;
+  edge?: boolean; rank_edge?: boolean; base_up?: number | null; base_beat?: number | null;
 }
 
 export interface QuantModelInfo {
@@ -318,6 +331,7 @@ export const research = {
   neural: (symbol: string) => api<NeuralResult>(`/api/research/neural/${enc(symbol)}`),
   neuralLeaderboard: (h = 21, n = 15) => api<NeuralLeaderboard>(`/api/research/neural-leaderboard?h=${h}&n=${n}`),
   neuralIntraday: () => api<NeuralIntradayInfo>("/api/research/neural-intraday-model"),
+  neuralUniverse: (h = 21) => api<NeuralUniverse>(`/api/research/neural-universe?h=${h}`),
   screener: (symbol: string, refresh = false, view: "auto" | "consolidated" | "standalone" = "auto") =>
     api<Fundamentals>(`/api/research/screener/${enc(symbol)}?refresh=${refresh ? 1 : 0}&view=${view}`),
   aiConfig: () => api<AiConfig>("/api/research/ai-config"),

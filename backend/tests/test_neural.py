@@ -174,6 +174,12 @@ def test_train_export_and_serve(tmp_path, monkeypatch):
         r = await svc.result(sym)
         assert r["status"] == "ready" and len(r["horizons"]) == 3
         assert all(0 < h["p_up"] < 1 for h in r["horizons"])
+        assert all(0 < h["p_beat"] < 1 for h in r["horizons"])
+        # the NEURAL shell: the stock's own inputs, and every stock at a horizon
+        assert len(r["trace"]["z"]) == len(r["trace"]["keys"]) and all(len(z) == ds.SEQ_LEN for z in r["trace"]["z"])
+        assert r["groups"]["ranks"] and len(r["groups"]["fundamentals"]) == len(fu.FUND_KEYS)
+        u = await svc.universe(21)
+        assert len(u["rows"]) == len(frames) and all(0 < x["p_beat"] < 1 for x in u["rows"])
         lb = await svc.leaderboard(5, 3)
         assert lb["n"] == len(frames) and (lb["ranked"] or (lb["top"] == [] and lb["edge_note"]))
     asyncio.run(go())
