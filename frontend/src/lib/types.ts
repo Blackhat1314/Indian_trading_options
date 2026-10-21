@@ -63,7 +63,7 @@ export interface LockStats {
 export interface NeuralTop {
   status: "ok" | "pending" | "missing" | "no_edge" | "error" | "off";
   note?: string; verdict?: string; edge?: boolean; edge_note?: string | null; trained_at?: number;
-  computed_at?: number; late_s?: number; n?: number; skipped?: number;
+  computed_at?: number; late_s?: number; n?: number; skipped?: number; uses?: string | null;
   long?: Pick[]; short?: Pick[]; since_lock?: LockStats | null;
 }
 

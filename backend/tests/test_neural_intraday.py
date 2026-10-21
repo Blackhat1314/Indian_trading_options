@@ -313,7 +313,8 @@ def test_planted_pattern_is_found_and_beats_the_ranker(tmp_path):
     assert beat["neural"]["auc"] > 0.58 and beat["neural"]["auc"] > beat["ranker"]["auc"] + 0.03
     nn, rkr = meta["trading"]["neural"], meta["trading"]["ranker"]
     assert nn["ls_avg"] > 0 and nn["ic"] > rkr["ic"]
-    assert meta["edge"] is True and meta["verdict"].startswith("beats")
+    assert meta["edge"] is True and "beats the TOP5 ranker" in meta["verdict"]
+    assert meta["deploy"]["model"] == "neural" and meta["deploy"]["judged_on"] == "neural"   # trees off: no choice
     assert len(meta["search"]["chosen_per_fold"]) == len(IP.folds) and meta["search"]["candidates"] == 2
     files = ti.export(ens, IP, meta, tmp_path)
     assert json.loads(files[1].read_text())["onnx_check_max_diff"] < 1e-4
