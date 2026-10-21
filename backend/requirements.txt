@@ -14,4 +14,5 @@ xlrd>=2.0
 beautifulsoup4>=4.12   # Screener.in fundamentals (research desks)
 lxml>=5.0
 anthropic>=1.14        # AI analyst (AI_PROVIDER=anthropic)
+onnxruntime>=1.17      # NEURAL desk: runs the model trained on your PC (no PyTorch on the server)
 pytest>=8

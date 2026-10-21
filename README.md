@@ -245,6 +245,56 @@ every model shows how good it has actually been on data it never saw.
   5-year lake that is the honest result for 1 day and 1 month (AUC ≈ 0.52), with only a weak edge at 1 week.
   It retrains daily in the background (~1 minute); admins can retrain on demand.
 
+## NEURAL desk (Alt+N): a neural network trained on your PC
+
+**NeuralEdge** is a small neural network that reads, for every stock and day, the last 40 days of the QUANT desk's
+26 technical features (a GRU over the sequence), plus what was known that day beyond the stock's own chart:
+cross-sectional ranks of momentum / volume / trend, **point-in-time fundamentals** from Screener.in (a quarter's
+results count only 45 days after the quarter ends — 60 for March — so the model never "knows" results before the
+market did), **news** from the recorder's headline archive (a headline counts for a day only if it arrived by 15:30),
+the sector and a lender flag. One network predicts P(up) for 1 day, 1 week and 1 month; three trained copies are
+averaged.
+
+It is trained on a PC with a GPU (the server has none) and served here as an ONNX file with onnxruntime — no PyTorch
+on the server. **The training compares it with two baselines on exactly the same walk-forward test days**:
+QuantEdge's logistic regression (what the QUANT desk runs) and gradient-boosted trees. The desk shows all three
+report cards side by side and a verdict per horizon — *beats QuantEdge*, *has an edge but does not beat QuantEdge*,
+or *no reliable edge* (then that horizon gets no call and no leaderboard). A network that cannot beat a straight
+line says so.
+
+**Train it (Windows, GTX/RTX GPU):**
+
+1. On the server, package the training data (daily bars of every stock, the news archive, the Screener cache):
+   ```bash
+   cd ~/tradedesk && docker compose run --rm tools python /app/research/neural_export.py
+   ```
+   and download `data/neural/training-data-YYYYMMDD.zip` (GCP browser SSH: gear menu → *Download file*).
+2. On the PC, in a clone of this repo (PowerShell), once:
+   ```powershell
+   py -3.12 -m venv .venv; .venv\Scripts\activate
+   pip install torch --index-url https://download.pytorch.org/whl/cu130   # CUDA build; needs a current NVIDIA driver
+   pip install -r backend\requirements-train.txt
+   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+   ```
+   (If PowerShell refuses to run `activate`, allow local scripts once with
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. `cu130` covers Turing — GTX 16xx / RTX 20xx — and newer. If your driver can't be updated, use
+   `pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126`; on CPU only, plain
+   `pip install torch` works too, just slower.)
+3. Train (the GPU is used automatically; `--fetch-fundamentals` fetches the stocks the server's cache doesn't have
+   from Screener.in, one page every 3 s — about 20 minutes the first time, cached after):
+   ```powershell
+   python research\neural_train.py --data C:\path\to\training-data-20261021.zip --fetch-fundamentals
+   ```
+   It prints the three models' walk-forward AUC / IC per horizon and writes `model.onnx` + `model.json` next to the
+   data. Options: `--seeds 3`, `--epochs 15`, `--no-gbm` (skip the tree baseline, faster), `--device cpu`.
+4. Upload both files to the server (browser SSH → *Upload file*), then
+   `sudo mv ~/model.onnx ~/model.json ~/tradedesk/data/neural/`. The desk loads them within a minute — no restart —
+   and scores every stock; fundamentals the server's cache lacks are fetched politely in the background.
+
+Retrain every few weeks: each run also learns from the headlines recorded since. The news inputs matter only once
+the archive covers a few months — the report card shows the coverage, and says when an input carries no information
+yet.
+
 ## PAPER TRADE desk (Alt+P): automatic paper trading
 
 Every logged-in user gets their own paper account with two books. You set the money, and the engine decides
@@ -579,6 +629,7 @@ each day's close, so early moves mean-revert by construction.
 | `/` or `Ctrl+K` | command line |
 | `F1`…`F10` / `Alt+1`…`0` | switch desk |
 | `Alt+Q` | QUANT desk |
+| `Alt+N` | NEURAL desk |
 | `Alt+P` | PAPER TRADE desk (`1`…`5` switch its views) |
 | `RELIANCE` ⏎ | load a symbol into chart and depth (on a research desk: into that desk) |
 | `TOP5` `MKT` `FNO` `SWING` `NEWS` `ALRT` `GEO` `AI` `SCRN` `MC` `QUANT` | open a desk |
@@ -602,6 +653,8 @@ backend/td/
   analytics/           intraday ranker · option math · SMC · swing · news · market breadth · alerts
   research/            research desks: tsmath (GARCH, Kalman, HMM, bootstrap…) · montecarlo · quant ·
                        screener (Screener.in) · llm (Claude / OpenAI-compatible) · ai (the analyst) · data
+  neural/              NeuralEdge: fundamentals (point-in-time) · news (archive features) · dataset (panel) ·
+                       model (PyTorch, training only) · train (walk-forward + ONNX export) · runtime (onnxruntime serving)
   paper/               paper trading: features (point-in-time) · models (ridge + GBM, numpy) · intraday · swing ·
                        sim (trade replay) · costs (charges, slippage) · broker (accounts, book) · train · backtest
   lake.py              Parquet lake (+ DuckDB coverage)
@@ -610,7 +663,8 @@ backend/tests/         pytest (packet layouts, BS/IV, SMC non-repainting, ranker
                        Dhan token keeper (renewal, TOTP, followers, admin API),
                        research maths, Monte Carlo calibration, quant causality, Screener parser, AI client & analyst, research API)
 backfill/backfill.py   5-year history tool
-research/              evaluate_intraday.py (walk-forward backtest + weight fitting)
+research/              evaluate_intraday.py (walk-forward backtest + weight fitting) · neural_export.py (server) ·
+                       neural_train.py (PC)
 scripts/               mock_dhan.py (local fake Dhan for testing the live path) · dev.sh
 frontend/              React 19 + TypeScript + lightweight-charts terminal; MapLibre GL map for the GEO desk
 run.py                 one-command launcher · docker-compose.yml · Dockerfile · .env.example

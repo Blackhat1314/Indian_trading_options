@@ -146,6 +146,7 @@ class Research:
         self.data = data or ResearchData(redis, lake)
         self.cpu = asyncio.Semaphore(cpu_slots)
         self._screener, self._quant, self._ai, self._mc = screener, quant, ai, mc
+        self._neural = None
         self.tasks: set[asyncio.Task] = set()
 
     def _lazy(self, attr: str, what: str, build: Callable[[], Any]) -> Any:
@@ -179,6 +180,18 @@ class Research:
             from ..research.quant import QuantService
             return QuantService(self.data)
         return self._lazy("_quant", "quant model", build)
+
+    @property
+    def neural(self):
+        def build():
+            from ..neural.runtime import NeuralService
+            screener = None
+            try:
+                screener = self.screener
+            except Unavailable:
+                pass
+            return NeuralService(self.data, screener)
+        return self._lazy("_neural", "neural model", build)
 
     @property
     def ai(self):
@@ -414,6 +427,32 @@ def make_router(current: Callable, admin: Callable, csrf: Callable) -> APIRouter
             return _JSON(await rs.quant.leaderboard(h, n))
         except Exception as e:
             raise _fail("quant leaderboard", e) from e
+
+    # ---- neural model (trained on a PC, served from data/neural/)
+    @router.get("/neural-model")
+    async def neural_model(rs: State, who=Depends(current)):
+        try:
+            return _JSON(await rs.neural.info())
+        except Exception as e:
+            raise _fail("neural model info", e) from e
+
+    @router.get("/neural-leaderboard")
+    async def neural_leaderboard(rs: State, h: int = 21, n: Annotated[int, Query(ge=1, le=50)] = 15,
+                                 who=Depends(current)):
+        if h not in QUANT_HORIZONS:
+            raise HTTPException(422, f"h must be one of {', '.join(map(str, QUANT_HORIZONS))} (trading days)")
+        try:
+            return _JSON(await rs.neural.leaderboard(h, n))
+        except Exception as e:
+            raise _fail("neural leaderboard", e) from e
+
+    @router.get("/neural/{symbol}")
+    async def neural(symbol: Symbol, rs: State, who=Depends(current)):
+        try:
+            info = await resolve(rs, symbol)
+            return _JSON(await rs.neural.result(info.symbol))
+        except Exception as e:
+            raise _fail("neural model", e) from e
 
     # ---- Screener.in fundamentals
     @router.get("/screener/{symbol}")

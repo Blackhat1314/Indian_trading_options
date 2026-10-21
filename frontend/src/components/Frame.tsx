@@ -17,6 +17,7 @@ export const DESKS: { id: DeskId; key: string; label: string; cmd: string }[] = 
   { id: "screener", key: "F9", label: "SCREENER", cmd: "SCRN" },
   { id: "montecarlo", key: "F10", label: "MONTE CARLO", cmd: "MC" },
   { id: "quant", key: "Alt+Q", label: "QUANT", cmd: "QUANT" },
+  { id: "neural", key: "Alt+N", label: "NEURAL", cmd: "NEURAL" },
   { id: "paper", key: "Alt+P", label: "PAPER TRADE", cmd: "PAPER" },
 ];
 // SYSTEM and the history pulls live on the separate admin page (/admin), for admins only.
@@ -79,7 +80,7 @@ function CommandBar() {
         } else {
           select(inst.symbol);
           const d = useLive.getState().desk;
-          if (["ai", "screener", "montecarlo", "quant"].includes(d)) useLive.getState().setResearchSymbol(inst.symbol);
+          if (["ai", "screener", "montecarlo", "quant", "neural"].includes(d)) useLive.getState().setResearchSymbol(inst.symbol);
           else if (!["intraday", "swing"].includes(d)) setDesk("intraday");
         }
       }
@@ -296,6 +297,7 @@ export function HelpModal() {
           <dt><kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the command line</dd>
           <dt><kbd>F1</kbd>…<kbd>F10</kbd> / <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>0</kbd></dt><dd>Switch desk</dd>
           <dt><kbd>Alt</kbd>+<kbd>Q</kbd></dt><dd>QUANT desk</dd>
+          <dt><kbd>Alt</kbd>+<kbd>N</kbd></dt><dd>NEURAL desk</dd>
           <dt><kbd>Alt</kbd>+<kbd>P</kbd></dt><dd>PAPER TRADE desk (sub-views: <kbd>1</kbd>…<kbd>5</kbd>)</dd>
           <dt>RELIANCE <kbd>GO</kbd></dt><dd>Load a symbol in the chart & depth</dd>
           <dt>TOP5 · MKT · FNO · SWING · NEWS · ALRT · GEO · AI · SCRN · MC · QUANT · PAPER</dt><dd>Open a desk</dd>

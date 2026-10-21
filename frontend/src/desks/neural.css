@@ -1,0 +1,48 @@
+/* NEURAL desk: picker, the selected stock's three forecasts, the report card against the baselines, the
+   leaderboard. Scrolls like the other research desks. */
+.desk-neural {
+  overflow-y: auto; align-content: start;
+  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 1fr);
+  grid-template-rows: repeat(4, max-content);
+  grid-template-areas:
+    "pick    pick"
+    "call    quality"
+    "lead    quality"
+    "disc    disc";
+}
+.desk-neural .warn { color: var(--amber); }
+.nn-pad { padding: 8px 10px; }
+.nn-busy { opacity: .5; transition: opacity .2s; }
+.nn-note { margin: 0; padding: 6px 10px 8px; font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.nn-note b { color: var(--text); font-weight: 600; }
+.nn-h3 {
+  margin: 0; padding: 8px 10px 3px; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+}
+.nn-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+.nn-card {
+  display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r);
+}
+.nn-card-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; }
+.nn-card-line { font-size: 11.5px; line-height: 1.4; color: var(--text-2); }
+.nn-card-line.muted { color: var(--muted); }
+.nn-model-line { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 8px 10px 4px; font-size: 12px; color: var(--text-2); }
+.nn-tbl tbody tr { cursor: default; }
+.nn-tbl td small { font-size: 10.5px; }
+.nn-cell { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
+.nn-verdict { white-space: normal !important; min-width: 120px; font-family: var(--font-ui) !important; font-size: 11.5px; color: var(--text-2); }
+.nn-lead-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.nn-lead-col { min-width: 0; }
+.nn-lead-col tbody tr { cursor: pointer; }
+.nn-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; font-size: 12.5px; line-height: 1.5; color: var(--text-2); }
+.nn-steps b { color: var(--text); }
+.nn-steps pre {
+  margin: 6px 0 2px; padding: 8px 10px; overflow-x: auto; white-space: pre; font-size: 11.5px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r); color: var(--text);
+}
+.nn-steps code { font-size: 11.5px; }
+@media (max-width: 1180px) {
+  .desk-neural { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pick" "call" "quality" "lead" "disc"; }
+  .nn-cards, .nn-lead-grid { grid-template-columns: minmax(0, 1fr); }
+}
