@@ -6,8 +6,8 @@ import type {
   AlertFire, ChainSnap, Clock, FnoSnap, Instrument, Market, NewsItem, RankSnap, SwingSnap, TopSnap,
 } from "./types";
 
-export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant" | "paper";
-const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant", "paper"];
+export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant" | "neural" | "paper";
+const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant", "neural", "paper"];
 
 export interface Toast { id: number; kind: "alert" | "event"; title: string; body: string; ts: number }
 

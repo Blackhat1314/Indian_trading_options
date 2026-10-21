@@ -128,6 +128,43 @@ export interface QuantMetric {
   edge: boolean; edge_note: string | null;
 }
 
+// ---------------------------------------------------------------- NeuralEdge (trained on a PC, served as ONNX)
+export interface NeuralMetric {
+  h: number; auc: number | null; auc_se: number | null; ic: number | null; acc: number | null;
+  brier: number | null; brier_base: number | null; base_rate: number | null; n_test: number; folds: number;
+  fold_auc: (number | null)[]; edge: boolean; edge_note: string | null; calib_b: number | null;
+}
+export interface NeuralHorizonInfo {
+  h: number; label: string; verdict: string;
+  metrics: { neural: NeuralMetric; quantedge?: NeuralMetric; gbm?: NeuralMetric };
+  calibration?: { base: number; b: number } | null;
+}
+export interface NeuralInfo {
+  status: "ready" | "computing" | "missing" | "error";
+  error?: string; folder?: string; progress?: number; message?: string;
+  trained_at?: number; device?: string; torch?: string; rows?: number; params?: number; seeds?: number;
+  seq_len?: number; symbols?: number; epochs_median?: number;
+  coverage?: { stocks: number; rows: number; fundamentals_stocks: number; fundamentals_rows: number;
+               quarterly_rows: number; news_rows: number; news_start: number | null };
+  notes?: string[];
+  evaluation?: { test_start: string; test_end: string; folds: string[][]; purge_days: number; baselines: string[] };
+  timing?: { neural_s: number; baselines_s: number; total_s: number };
+  horizons?: NeuralHorizonInfo[];
+  predicted_at?: number | null; as_of?: string | null;
+}
+export interface NeuralLeader { symbol: string; sector: string; p_up: number | null; close: number | null }
+export interface NeuralLeaderboard {
+  model: NeuralInfo; h: number; as_of?: string; ranked: boolean; n?: number; computing?: boolean;
+  verdict?: string; edge_note?: string | null; top: NeuralLeader[]; bottom: NeuralLeader[];
+}
+export interface NeuralResult {
+  symbol: string; status: "ready" | "computing" | "missing" | "error"; as_of?: string; close?: number;
+  sector?: string; model: NeuralInfo;
+  horizons?: { h: number; label: string; p_up: number | null; edge: boolean; edge_note: string | null;
+               oos_auc: number | null; verdict: string; rank_pct: number | null }[];
+  inputs?: { fundamentals: number; fundamentals_of: number; news_on: boolean };
+}
+
 export interface QuantModelInfo {
   status: "ready" | "training" | "missing" | "error";
   progress: number; message: string;
@@ -254,6 +291,9 @@ export const research = {
   quantModel: () => api<QuantModelInfo>("/api/research/quant-model"),
   quantTrain: () => post<QuantModelInfo>("/api/research/quant-model/train", {}),
   leaderboard: (h = 21, n = 15) => api<QuantLeaderboard>(`/api/research/quant-leaderboard?h=${h}&n=${n}`),
+  neuralModel: () => api<NeuralInfo>("/api/research/neural-model"),
+  neural: (symbol: string) => api<NeuralResult>(`/api/research/neural/${enc(symbol)}`),
+  neuralLeaderboard: (h = 21, n = 15) => api<NeuralLeaderboard>(`/api/research/neural-leaderboard?h=${h}&n=${n}`),
   screener: (symbol: string, refresh = false, view: "auto" | "consolidated" | "standalone" = "auto") =>
     api<Fundamentals>(`/api/research/screener/${enc(symbol)}?refresh=${refresh ? 1 : 0}&view=${view}`),
   aiConfig: () => api<AiConfig>("/api/research/ai-config"),

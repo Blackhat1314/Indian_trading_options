@@ -19,6 +19,7 @@ const AiAnalyst = lazy(() => import("./desks/AiAnalyst"));
 const Screener = lazy(() => import("./desks/Screener"));
 const MonteCarlo = lazy(() => import("./desks/MonteCarlo"));
 const Quant = lazy(() => import("./desks/Quant"));
+const Neural = lazy(() => import("./desks/Neural"));
 const Paper = lazy(() => import("./desks/Paper"));
 
 const BASE_TOPICS = ["clock", "market", "top", "quotes", "geo:risk"];
@@ -34,6 +35,7 @@ const DESK_TOPICS: Record<DeskId, string[]> = {
   screener: [],
   montecarlo: [],
   quant: [],
+  neural: [],
   paper: ["paper"], // public signals snapshot; the account itself is polled over REST (per user)
 };
 
@@ -117,6 +119,7 @@ export default function App() {
               {desk === "screener" && <Screener />}
               {desk === "montecarlo" && <MonteCarlo />}
               {desk === "quant" && <Quant />}
+              {desk === "neural" && <Neural />}
               {desk === "paper" && <Paper />}
             </Suspense>
           </DeskBoundary>
