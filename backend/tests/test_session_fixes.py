@@ -143,3 +143,16 @@ def test_short_chips_say_relative_weakness():
     chips = intraday.factor_chips(r, "short")
     assert "RW" in chips and "RS" not in chips
     assert "RS" in intraday.factor_chips(dict(r, resid=1.8, orb=1.2, vwap_atr=0.4), "long")
+
+
+def test_restored_lock_without_prices_sends_null_summary(live):
+    """Right after a restart (evening rebuild) the lock comes back from Redis before any price: the desk must get
+    null for the since-lock summary, not {} (it read {}.leaders and crashed)."""
+    e = engine()
+    for s in e.eqs:
+        s.ltp = 0.0
+    e.top = {"locked": True, "lock_time": "09:30:00", "long": [{"symbol": "S1", "entry": 100.0, "target": 101.0,
+                                                              "invalidation": 99.5, "chips": ["RVOL 2.1x"]}],
+             "short": []}
+    v = e.top_view()
+    assert v["universe_since_lock"] is None and v["long"][0]["symbol"] == "S1"

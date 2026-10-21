@@ -16,9 +16,9 @@ function PickRow({ p, i, side, locked, selected }: { p: Pick; i: number; side: "
       aria-label={`${side} pick ${i + 1}: ${p.symbol}`}>
       <span className="pick-n">{i + 1}</span>
       <span style={{ minWidth: 0 }}>
-        <span className="pick-sym">{p.symbol}<small>{p.sector}</small><small>score {p.score.toFixed(2)}</small></span>
+        <span className="pick-sym">{p.symbol}<small>{p.sector}</small><small>score {(p.score ?? 0).toFixed(2)}</small></span>
         <span className="chips pick-chips">
-          {p.chips.slice(0, 6).map((c) => (
+          {(p.chips ?? []).slice(0, 6).map((c) => (
             <span key={c} className={`chip ${c === "LB" || c === "ORB" || c === "VWAP+" ? "up" : c === "SB" || c === "ORBD" || c === "VWAP-" ? "down" : c.startsWith("RVOL") ? "amber" : c === "RS" || c === "RW" ? "cyan" : "violet"}`}
               title={c === "RS" ? "Relative strength: up more than its beta × NIFTY" : c === "RW" ? "Relative weakness: down more than its beta × NIFTY" : undefined}>{c}</span>
           ))}
@@ -60,7 +60,7 @@ function TopPicks() {
   return (
     <Panel code="TOP5" title="Intraday picks" sub={sub} area="picks" id="picks" className="picks-panel"
       actions={top.locked ? <span className="chip up">LOCKED</span> : top.closed ? <span className="chip">CLOSED</span> : <span className="chip amber">LIVE RANKING</span>}
-      foot={top.locked && u ? (
+      foot={top.locked && u && typeof u.long_avg === "number" ? (
         <div className="lockbar" aria-label="Performance since lock">
           <span className="amber b">SINCE LOCK</span>
           <span className="kv"><span>Long avg</span><span className={cls(u.long_avg)}>{pct(u.long_avg)}</span></span>
@@ -68,7 +68,7 @@ function TopPicks() {
           <span className="kv"><span>Universe</span><span className={cls(u.universe_avg)}>{pct(u.universe_avg)}</span></span>
           <span className="kv"><span>In top-5</span><span>{u.long_hits_top5}/5</span></span>
           <span className="kv"><span>In top-20</span><span>{u.long_hits_top20}/5</span></span>
-          <span className="kv"><span>Leaders</span><span className="muted">{u.leaders.slice(0, 3).map((l) => `${l.symbol} ${signed(l.ret, 1)}%`).join(" · ")}</span></span>
+          <span className="kv"><span>Leaders</span><span className="muted">{(u.leaders ?? []).slice(0, 3).map((l) => `${l.symbol} ${signed(l.ret, 1)}%`).join(" · ")}</span></span>
         </div>
       ) : undefined}>
       <div className="picks">
