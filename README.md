@@ -251,6 +251,15 @@ Two networks, both trained on a PC with a GPU (the server has none) and served h
 no PyTorch on the server. Both are scored walk-forward against simpler models **on exactly the same test days**, and
 neither makes a call where its edge did not pass the test.
 
+**The neural shell** (top of the desk) draws what the network is doing right now. Every scored stock is a cluster
+of points on a slowly turning ring, grouped by sector: colour is its probability against the average stock (cyan
+above, red below), the spike is how far the network pushes it, and today's 09:30 picks stand out in amber
+(long) and magenta (short). Hover a stock to read it, click to select it. On the left, wires carry the selected
+stock's actual inputs into the shell (the 40-day paths of six of its technical features, its fundamentals, news and
+1-minute context), glowing with their strength; on the right come its forecasts and the 09:30 picks; underneath,
+how the whole universe is spread. A horizon without an edge draws a flat shell and says so. The motion stops off
+screen and under "reduce motion".
+
 **The daily model** reads, for every stock and day, the last 40 days of the QUANT desk's 26 technical features (a
 GRU over the sequence), plus what was known that day beyond the stock's own chart: cross-sectional ranks of momentum
 / volume / trend, **point-in-time fundamentals** from Screener.in (a quarter's results count only 45 days after the

@@ -436,6 +436,16 @@ def make_router(current: Callable, admin: Callable, csrf: Callable) -> APIRouter
         except Exception as e:
             raise _fail("neural model info", e) from e
 
+    @router.get("/neural-universe")
+    async def neural_universe(rs: State, h: int = 21, who=Depends(current)):
+        """Every scored stock at one horizon (the NEURAL shell)."""
+        if h not in QUANT_HORIZONS:
+            raise HTTPException(422, f"h must be one of {', '.join(map(str, QUANT_HORIZONS))} (trading days)")
+        try:
+            return _JSON(await rs.neural.universe(h))
+        except Exception as e:
+            raise _fail("neural universe", e) from e
+
     @router.get("/neural-intraday-model")
     async def neural_intraday_model(rs: State, who=Depends(current)):
         """The 09:30 model's report card (its picks travel with the live `top` snapshot)."""
