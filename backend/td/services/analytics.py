@@ -4,7 +4,8 @@ Consumes td:ticks / td:news / td:events and publishes (SET td:snap:<topic> + PUB
   clock     market time & phase
   market    indices, breadth, sector heatmap, movers
   rank      live intraday factor ranking (every F&O stock)
-  top       09:30 locked top-N long/short picks + live tracking (provisional before lock)
+  top       09:30 locked top-N long/short picks + live tracking (provisional before lock), and the 09:30 neural
+            model's picks next to them when a trained model with a measured edge is installed (td.neural.live)
   fno       futures OI build-up board (LB / SB / SC / LU)
   chain:<X> option-chain analytics (PCR, max pain, GEX, walls, IV, skew)
   swing     swing scanner + historical setup statistics
@@ -24,6 +25,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .. import bus
@@ -38,12 +40,17 @@ from ..analytics import intraday, market, optmath, swing
 from ..analytics.context import load_context
 from ..analytics.news import NewsEngine
 from ..analytics.state import InstState, safe
+from ..neural.live import LiveIntraday, overnight_news
 
 log = logging.getLogger("td.analytics")
 LOCK_GRACE_S = 600      # picks may lock up to 10 minutes after LOCK_TIME (e.g. a slow start), never later
 NO_TRADING_FRACTION = 0.2   # fewer stocks than this moved → nothing traded (closure or dead feed): no lock, no card
 TARGET_ATR = 1.0        # pick target, in 14-day ATRs from the entry
 STOP_ATR = 0.6          # the stop (opening-range low/high) is never further than this
+
+
+def dt_time(dt):
+    return dt.timetz().replace(tzinfo=None)
 
 
 def _hm(minute: int) -> str:
@@ -79,6 +86,7 @@ class Engine:
         self.new_news_symbols: set[str] = set()
         self.ticks_seen = 0
         self.lock_t = parse_hms(settings.lock_time)
+        self.nn = LiveIntraday()
 
     def _load_weights(self):
         p = Path(settings.data_dir) / "config" / "ranker_weights.json"
@@ -191,6 +199,8 @@ class Engine:
                             s.min_since_lock = min(s.lock_px, *(b[2] for b in after))
         await self._merge_seed_bars(day)
         asyncio.create_task(self.refresh_swing(initial=True))
+        if n_hist:
+            asyncio.create_task(self.nn.prepare(day))     # the 09:30 model's daily context, in a worker process
         log.info("context loaded for %s (%d daily series with history)", day, n_hist)
 
     async def _merge_seed_bars(self, day) -> int:
@@ -364,12 +374,66 @@ class Engine:
             "lock_scores": {str(r["sid"]): [r["score"], r["score_s"]] for r in self.rows},
             "abstained": {"long": self.cfg.top_n - len(longs), "short": self.cfg.top_n - len(shorts)},
         }
+        self.top["neural"] = await self._neural_picks(dt.date())
         await self.r.set(bus.k_top(dt.date().isoformat()), bus.dumps(self.top), ex=7 * 86400)
         await bus.publish_event(self.r, "event", {"kind": "LOCK", "msg": f"Top picks locked at {settings.lock_time}",
                                                   "long": [p["symbol"] for p in self.top["long"]],
                                                   "short": [p["symbol"] for p in self.top["short"]]})
         log.info("LOCKED long=%s short=%s", [p["symbol"] for p in self.top["long"]],
                  [p["symbol"] for p in self.top["short"]])
+
+    # ------------------------------------------------------------------ the 09:30 neural model
+    async def _neural_picks(self, day) -> dict:
+        """Neural picks from the state at the lock; {"status": ...} when there are none (no model, no edge, the
+        context still being built, or LOCK_TIME is not the 09:30 the model was trained for)."""
+        self.nn.load()
+        if self.nn.state != "ready":
+            return self.nn.summary()
+        if (self.lock_t.hour, self.lock_t.minute) != (9, 30):
+            return {"status": "off", "note": f"the neural model is a 09:30 model; LOCK_TIME is {settings.lock_time}"}
+        if not self.nn.ready_for(day):
+            await self.nn.prepare(day)
+            return {"status": "pending", "note": "the daily context is still being built — picks follow when ready"}
+        try:
+            news = await asyncio.to_thread(overnight_news, self.eqs, day, self.nn.ctx["rows"])
+            eqs = list(self.eqs)
+            n = np.stack([news.get(s.symbol, np.zeros(3)) for s in eqs])
+            res = self.nn.score(day, eqs, self.idx.get("NIFTY"), n, self.cfg.min_turnover_cr)
+        except Exception as e:
+            log.exception("09:30 neural picks failed")
+            return {"status": "error", "note": f"{type(e).__name__}: {e}"}
+        if res.get("status") != "ok":
+            return res
+        lock_px = self.top.get("lock_px") or {}
+        by = {r["symbol"]: r for r in self.rows}
+        out = {k: v for k, v in res.items() if k not in ("long", "short")}
+        for side in ("long", "short"):
+            views = []
+            for sym in res[side]:
+                r, st = by.get(sym), self.eq_by_symbol.get(sym)
+                if r is None or st is None:
+                    continue
+                entry = lock_px.get(str(st.sid)) or r["ltp"]
+                v = self._pick_view(dict(r, ltp=entry), side)
+                v["p_up"], v["p_beat"] = res["p"].get(sym, [None, None])
+                views.append(v)
+            out[side] = views
+        late = time.time() - float(self.top.get("lock_ts") or time.time())
+        out["late_s"] = round(late) if late > 60 else 0
+        log.info("NEURAL 09:30 long=%s short=%s", res["long"], res["short"])
+        return out
+
+    async def maybe_neural_late(self):
+        """The lock came before the daily context was ready: make the neural picks as soon as it is (same 09:30
+        inputs and entries; `late_s` says how long after the lock)."""
+        nn = self.top.get("neural") or {}
+        if not self.top.get("locked") or nn.get("status") != "pending":
+            return
+        day = from_epoch(self.clock).date()
+        if not self.nn.ready_for(day) or dt_time(from_epoch(self.clock)) >= MARKET_CLOSE:
+            return
+        self.top["neural"] = await self._neural_picks(day)
+        await self.r.set(bus.k_top(day.isoformat()), bus.dumps(self.top), ex=7 * 86400)
 
     def _pick_view(self, r: dict, side: str) -> dict:
         s = self.eq_by_symbol[r["symbol"]]
@@ -390,30 +454,42 @@ class Engine:
                 "f": r["f"], "rvol": r["rvol"], "gap": r["gap"], "chg_at_lock": r["chg"], "headline": r["headline"],
                 "invalidation": safe(inval), "target": safe(tgt), "oi_tag": r["oi_tag"]}
 
+    def _track(self, picks: list[dict], side: str) -> list[dict]:
+        live = []
+        for p in picks:
+            s = self.eq_by_symbol.get(p["symbol"])
+            q = dict(p)
+            if s and s.ltp:
+                sgn = 1 if side == "long" else -1
+                q["ltp"] = safe(s.ltp)
+                q["chg"] = safe(s.chg)
+                q["pnl"] = safe(sgn * (s.ltp / p["entry"] - 1) * 100)
+                q["mfe"] = safe(((s.max_since_lock / p["entry"] - 1) * 100) if side == "long"
+                                else ((1 - s.min_since_lock / p["entry"]) * 100))
+                q["mae"] = safe(((s.min_since_lock / p["entry"] - 1) * 100) if side == "long"
+                                else ((1 - s.max_since_lock / p["entry"]) * 100))
+                q["status"], q["hit_at"] = self._outcome(s, p, side)
+                q["spark"] = [b[3] for _, b in sorted(s.bars.items())][-90:]
+            live.append(q)
+        return live
+
     def top_view(self) -> dict:
         if self.top.get("locked"):
-            out = {k: v for k, v in self.top.items() if k not in ("lock_px", "lock_scores")}
+            out = {k: v for k, v in self.top.items() if k not in ("lock_px", "lock_scores", "neural")}
             for side in ("long", "short"):
-                live = []
-                for p in self.top.get(side, []):
-                    s = self.eq_by_symbol.get(p["symbol"])
-                    q = dict(p)
-                    if s and s.ltp:
-                        sgn = 1 if side == "long" else -1
-                        q["ltp"] = safe(s.ltp)
-                        q["chg"] = safe(s.chg)
-                        q["pnl"] = safe(sgn * (s.ltp / p["entry"] - 1) * 100)
-                        q["mfe"] = safe(((s.max_since_lock / p["entry"] - 1) * 100) if side == "long"
-                                        else ((1 - s.min_since_lock / p["entry"]) * 100))
-                        q["mae"] = safe(((s.min_since_lock / p["entry"] - 1) * 100) if side == "long"
-                                        else ((1 - s.max_since_lock / p["entry"]) * 100))
-                        q["status"], q["hit_at"] = self._outcome(s, p, side)
-                        q["spark"] = [b[3] for _, b in sorted(s.bars.items())][-90:]
-                    live.append(q)
-                out[side] = live
+                out[side] = self._track(self.top.get(side, []), side)
             # how the picks rank vs everything since the lock
             # empty right after a restart, until the first prices arrive: send null, not {}
             out["universe_since_lock"] = self._since_lock_stats() or None
+            nn = self.top.get("neural")
+            if nn:
+                v = {k: x for k, x in nn.items() if k != "p"}
+                if nn.get("status") == "ok":
+                    v["long"] = self._track(nn.get("long", []), "long")
+                    v["short"] = self._track(nn.get("short", []), "short")
+                    v["since_lock"] = self._since_lock_stats([p["symbol"] for p in nn.get("long", [])],
+                                                             [p["symbol"] for p in nn.get("short", [])]) or None
+                out["neural"] = v
             return out
         dt = from_epoch(self.clock)
         closed = holiday_name(dt.date()) or self.top.get("closed")
@@ -459,7 +535,7 @@ class Engine:
                 return "TARGET", None
         return "LIVE", None
 
-    def _since_lock_stats(self) -> dict:
+    def _since_lock_stats(self, longs: list[str] | None = None, shorts: list[str] | None = None) -> dict:
         rets = [(s.symbol, (s.ltp / s.lock_px - 1) * 100) for s in self.eqs if s.lock_px and s.ltp]
         if not rets:
             return {}
@@ -468,8 +544,10 @@ class Engine:
         top5 = {sym for sym, _ in rets[:5]}
         top20 = {sym for sym, _ in rets[:20]}
         bot5 = {sym for sym, _ in rets[-5:]}
-        longs = [p["symbol"] for p in self.top.get("long", [])]
-        shorts = [p["symbol"] for p in self.top.get("short", [])]
+        if longs is None:
+            longs = [p["symbol"] for p in self.top.get("long", [])]
+        if shorts is None:
+            shorts = [p["symbol"] for p in self.top.get("short", [])]
         retmap = dict(rets)
         lavg = sum(retmap.get(s, 0) for s in longs) / len(longs) if longs else 0
         savg = sum(-retmap.get(s, 0) for s in shorts) / len(shorts) if shorts else 0
@@ -506,6 +584,21 @@ class Engine:
                 "n_long": len(longs), "long_green": green, **st,
                 "excess_long": safe(st.get("long_avg", 0) - st.get("universe_avg", 0)),
                 "picks": longs, "shorts": [p["symbol"] for p in self.top.get("short", [])]}
+        nn = self.top.get("neural") or {}
+        if nn.get("status") == "ok":
+            nl, ns = [p["symbol"] for p in nn.get("long", [])], [p["symbol"] for p in nn.get("short", [])]
+            ns_st = self._since_lock_stats(nl, ns)
+            pp = nn.get("p") or {}
+            pairs = [(pp[s.symbol][1], (s.ltp / s.lock_px - 1) * 100) for s in self.eqs
+                     if s.lock_px and s.ltp and s.symbol in pp and pp[s.symbol][1] is not None]
+            nic = intraday.spearman([a for a, _ in pairs], [b for _, b in pairs]) if pairs else float("nan")
+            card["neural"] = {"picks": nl, "shorts": ns, "ic": safe(nic, 3) if nic == nic else None,
+                              "long_avg": ns_st.get("long_avg"), "short_avg": ns_st.get("short_avg"),
+                              "long_hits_top5": ns_st.get("long_hits_top5"),
+                              "long_hits_top20": ns_st.get("long_hits_top20"),
+                              "short_hits_bottom5": ns_st.get("short_hits_bottom5"),
+                              "excess_long": safe(ns_st.get("long_avg", 0) - ns_st.get("universe_avg", 0)),
+                              "late_s": nn.get("late_s", 0), "trained_at": nn.get("trained_at")}
         await self.r.lpush(bus.KEY_SCORECARD, bus.dumps(card))
         await self.r.ltrim(bus.KEY_SCORECARD, 0, 499)
         await self.r.set(f"td:scorecard:done:{dt.date().isoformat()}", "1", ex=3 * 86400)
@@ -566,6 +659,7 @@ class Engine:
                                                      "minute": safe(self.minute(), 1)})
         self.rows = self.compute_rank()
         await self.maybe_lock()
+        await self.maybe_neural_late()
         await self.maybe_scorecard()
         rows_by_symbol = {r["symbol"]: r for r in self.rows}
         indices = []

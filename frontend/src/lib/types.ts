@@ -51,16 +51,28 @@ export interface Pick {
   rvol: number; gap: number; chg_at_lock: number; headline: string | null; invalidation: number; target: number;
   oi_tag: string; ltp?: number; chg?: number; pnl?: number; mfe?: number; mae?: number; status?: string;
   hit_at?: string | null; spark?: number[];
+  p_up?: number | null; p_beat?: number | null;     // the 09:30 neural model's picks
+}
+
+export interface LockStats {
+  universe_avg: number; long_avg: number; short_avg: number; long_hits_top5: number; long_hits_top20: number;
+  short_hits_bottom5: number; leaders: { symbol: string; ret: number }[]; laggards: { symbol: string; ret: number }[];
+}
+
+/** The 09:30 neural model's picks, made at the same lock as the TOP5 (td.neural.live). */
+export interface NeuralTop {
+  status: "ok" | "pending" | "missing" | "no_edge" | "error" | "off";
+  note?: string; verdict?: string; edge?: boolean; edge_note?: string | null; trained_at?: number;
+  computed_at?: number; late_s?: number; n?: number; skipped?: number;
+  long?: Pick[]; short?: Pick[]; since_lock?: LockStats | null;
 }
 
 export interface TopSnap {
   locked: boolean; provisional?: boolean; missed?: boolean; closed?: string; date?: string; lock_ts?: number; lock_time: string;
   seconds_to_lock?: number; long: Pick[]; short: Pick[];
   abstained?: { long: number; short: number };
-  universe_since_lock?: null | {
-    universe_avg: number; long_avg: number; short_avg: number; long_hits_top5: number; long_hits_top20: number;
-    short_hits_bottom5: number; leaders: { symbol: string; ret: number }[]; laggards: { symbol: string; ret: number }[];
-  };
+  universe_since_lock?: null | LockStats;
+  neural?: NeuralTop;
 }
 
 export interface FnoRow {

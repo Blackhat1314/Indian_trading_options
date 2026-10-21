@@ -7,7 +7,9 @@ of every stock with onnxruntime (no PyTorch here), and serves the results to the
 - Fundamentals come from the Screener.in cache the SCREENER desk already keeps; a background job tops up stocks
   that have none or an old copy, one polite request at a time. News comes from the recorder's archive.
 - A horizon without a walk-forward edge is not ranked: its probabilities are the base rate, and the leaderboard
-  says so instead of sorting noise.
+  says so instead of sorting noise. Models trained with "beats the median stock" heads rank on those when their
+  daily IC passed its test (a ranking edge), else on P(up) when that has an edge, else not at all.
+- Models trained with the 1-minute day summaries get them from the lake's last few days of 1-minute bars.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from ..config import settings
 from ..research import quant as qm
 from ..timeutil import IST
 from . import dataset as ds
+from . import minute as mn
 from . import news as nw
 
 log = logging.getLogger("td.neural.runtime")
@@ -114,7 +117,7 @@ class NeuralService:
                                      "notes", "evaluation", "timing", "epochs_median")}
         out["symbols"] = len(m.get("symbols") or [])
         out["horizons"] = [{"h": hz["h"], "label": hz["label"], "verdict": hz["verdict"], "metrics": hz["metrics"],
-                            "calibration": hz.get("calibration")} for hz in m["horizons"]]
+                            "calibration": hz.get("calibration"), "rank": hz.get("rank")} for hz in m["horizons"]]
         p = self._pred
         if not p:
             self._kick()
@@ -130,14 +133,21 @@ class NeuralService:
         if p is None:
             return {"model": info, "h": h, "top": [], "bottom": [], "ranked": False, "computing": True}
         hz = self._horizon(h)
-        edge = bool(hz["metrics"]["neural"].get("edge"))
-        rows = sorted(p["rows"].values(), key=lambda r: r["p"][str(h)], reverse=True)
+        rank_m = ((hz.get("rank") or {}).get("metrics") or {}).get("neural") or {}
+        rank_edge = bool(rank_m.get("edge"))
+        edge = rank_edge or bool(hz["metrics"]["neural"].get("edge"))
+        key = "pb" if rank_edge else "p"
+        rows = sorted(p["rows"].values(), key=lambda r: (r.get(key) or r["p"])[str(h)], reverse=True)
 
         def pick(rs: list[dict]) -> list[dict]:
-            return [{"symbol": r["symbol"], "sector": r["sector"], "p_up": r["p"][str(h)], "close": r["close"]}
-                    for r in rs]
+            return [{"symbol": r["symbol"], "sector": r["sector"], "p_up": r["p"][str(h)],
+                     "p_beat": (r.get("pb") or {}).get(str(h)), "close": r["close"]} for r in rs]
+        note = hz["metrics"]["neural"].get("edge_note")
+        if not edge and rank_m:
+            note = f"{note}; {rank_m.get('edge_note')}"
         out = {"model": info, "h": h, "as_of": p["as_of"], "ranked": edge, "n": len(rows),
-               "verdict": hz["verdict"], "edge_note": hz["metrics"]["neural"].get("edge_note")}
+               "ranked_by": ("beat" if rank_edge else "up") if edge else None,
+               "verdict": (hz.get("rank") or {}).get("verdict") if rank_edge else hz["verdict"], "edge_note": note}
         # without a measured edge the probabilities are the base rate for everyone: sorting them would rank noise
         out["top"], out["bottom"] = (pick(rows[:n]), pick(rows[::-1][:n])) if edge else ([], [])
         return out
@@ -156,12 +166,35 @@ class NeuralService:
         for hz in self._meta["horizons"]:
             h = hz["h"]
             nm = hz["metrics"]["neural"]
-            edge = bool(nm.get("edge"))
+            rm = ((hz.get("rank") or {}).get("metrics") or {}).get("neural") or {}
+            edge, rank_edge = bool(nm.get("edge")), bool(rm.get("edge"))
             hs.append({"h": h, "label": hz["label"], "p_up": r["p"][str(h)], "edge": edge,
                        "edge_note": nm.get("edge_note"), "oos_auc": nm.get("auc"), "verdict": hz["verdict"],
-                       "rank_pct": r["rank"][str(h)] if edge else None})
+                       "p_beat": (r.get("pb") or {}).get(str(h)), "rank_edge": rank_edge,
+                       "rank_note": rm.get("edge_note"), "oos_ic": rm.get("ic"),
+                       "rank_verdict": (hz.get("rank") or {}).get("verdict"),
+                       "rank_pct": r["rank"][str(h)] if (edge or rank_edge) else None})
         return {"symbol": r["symbol"], "status": "ready", "as_of": p["as_of"], "close": r["close"],
                 "sector": r["sector"], "horizons": hs, "inputs": r["inputs"], "model": info}
+
+    def intraday_info(self) -> dict:
+        """The 09:30 model's report card from data/neural/intraday.json (the analytics worker runs it)."""
+        from .live import read_meta
+        path = self.folder / "intraday.json"
+        if not path.exists():
+            return {"status": "missing", "folder": str(self.folder)}
+        try:
+            m = read_meta(path)
+        except Exception as e:
+            return {"status": "error", "error": f"{type(e).__name__}: {e}", "folder": str(self.folder)}
+        keep = ("trained_at", "device", "rows", "days", "params", "seeds", "heads", "trading", "edge", "edge_note",
+                "verdict", "coverage", "notes", "evaluation", "cost_pct", "top_n", "search", "epochs_median", "timing")
+        out = {k: m.get(k) for k in keep}
+        out["symbols"] = len(m.get("symbols") or [])
+        if out.get("search"):
+            out["search"] = {k: v for k, v in out["search"].items() if k != "final"}
+        out["status"] = "ready" if m.get("edge") else "no_edge"
+        return out
 
     # ------------------------------------------------------------ predictions
     @property
@@ -235,10 +268,15 @@ class NeuralService:
             since = (datetime.now(tz=IST) - timedelta(days=10)).date().isoformat()
             news_df = await asyncio.to_thread(nw.load_archive, root, since)
             start = _archive_first_day(root)
+            with_minute = "m_on" in meta["static_keys"]
+            tables = {}
+            if with_minute:
+                self._progress, self._message = 0.4, "1-minute summaries"
+                tables = await asyncio.to_thread(recent_tables, self.data, sorted(frames))
             self._progress, self._message = 0.45, "technical features"
             P = await asyncio.to_thread(ds.build, frames, index_df, fundamentals=fund, news=news_df,
-                                        news_start=start, hmm=meta.get("hmm") or {}, sectors=meta["sectors"],
-                                        last_only=True)
+                                        news_start=start, minute=tables, with_minute=with_minute,
+                                        hmm=meta.get("hmm") or {}, sectors=meta["sectors"], last_only=True)
             if P.static_keys != meta["static_keys"]:
                 raise ValueError("the model expects a different input layout — retrain it with the current code")
             idx = np.arange(P.rows)
@@ -246,17 +284,28 @@ class NeuralService:
                                                                         "static": P.static})[0])
             rows = {}
             ranks = {}
+            nh = len(meta["horizons"])
+            has_beat = probs.shape[1] >= 2 * nh
             for hi, hz in enumerate(meta["horizons"]):
                 cal = hz.get("calibration") or {}
                 p_cal = qm.calib_apply(probs[:, hi].astype(float), cal.get("base", 0.5), cal.get("b", 1.0))
                 probs[:, hi] = p_cal
-                order = np.argsort(np.argsort(-p_cal))
+                key = p_cal
+                if has_beat:
+                    rc = (hz.get("rank") or {}).get("calibration") or {}
+                    pb = qm.calib_apply(probs[:, nh + hi].astype(float), rc.get("base", 0.5), rc.get("b", 1.0))
+                    probs[:, nh + hi] = pb
+                    if (((hz.get("rank") or {}).get("metrics") or {}).get("neural") or {}).get("edge"):
+                        key = pb
+                order = np.argsort(np.argsort(-key))
                 ranks[hz["h"]] = 100.0 * (1 - order / max(P.rows - 1, 1))
             fund_cols = {k: meta["static_keys"].index(f"has_{k}") for k in meta["fund_keys"]}
             for i in range(P.rows):
                 sym = P.syms[P.row_sym[i]]
                 rows[sym] = {"symbol": sym, "sector": _sector(meta, P, i), "close": _f(P.close[i], 2),
                              "p": {str(hz["h"]): _f(probs[i, hi]) for hi, hz in enumerate(meta["horizons"])},
+                             "pb": ({str(hz["h"]): _f(probs[i, nh + hi]) for hi, hz in enumerate(meta["horizons"])}
+                                    if has_beat else None),
                              "rank": {str(h): _f(v[i], 1) for h, v in ranks.items()},
                              "inputs": {"fundamentals": int(sum(P.static[i, c] for c in fund_cols.values())),
                                         "fundamentals_of": len(fund_cols),
@@ -291,6 +340,23 @@ class NeuralService:
             log.info("NeuralEdge: fundamentals refreshed for %d/%d stocks", got, len(todo))
             self._pred = None                            # next request recomputes with them
         self._fund_task = asyncio.create_task(run(), name="neural-fundamentals")
+
+
+def recent_tables(data, syms: list[str], days: int = 3) -> dict:
+    """1-minute day tables of the last few sessions per stock (the daily model's 1-minute summaries)."""
+    lake = getattr(data, "lake", None)
+    if lake is None:
+        from ..lake import Lake
+        lake = Lake(settings.lake_dir)
+    out = {}
+    for s in syms:
+        try:
+            m = lake.read("1m", s, last_n=mn.SESSION * days)
+        except Exception:
+            continue
+        if len(m):
+            out[s] = mn.day_table(m)
+    return out
 
 
 def _sector(meta: dict, P: ds.Panel, i: int) -> str:

@@ -69,6 +69,11 @@ function TopPicks() {
           <span className="kv"><span>In top-5</span><span>{u.long_hits_top5}/5</span></span>
           <span className="kv"><span>In top-20</span><span>{u.long_hits_top20}/5</span></span>
           <span className="kv"><span>Leaders</span><span className="muted">{(u.leaders ?? []).slice(0, 3).map((l) => `${l.symbol} ${signed(l.ret, 1)}%`).join(" · ")}</span></span>
+          {top.neural?.status === "ok" && top.neural.since_lock && (
+            <span className="kv" title={`09:30 neural picks — long ${(top.neural.long ?? []).map((p) => p.symbol).join(", ")} · short ${(top.neural.short ?? []).map((p) => p.symbol).join(", ")} (NEURAL desk, Alt+N)`}>
+              <span className="cyan">Neural long</span><span className={cls(top.neural.since_lock.long_avg)}>{pct(top.neural.since_lock.long_avg)}</span>
+            </span>
+          )}
         </div>
       ) : undefined}>
       <div className="picks">

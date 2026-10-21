@@ -133,11 +133,33 @@ export interface NeuralMetric {
   h: number; auc: number | null; auc_se: number | null; ic: number | null; acc: number | null;
   brier: number | null; brier_base: number | null; base_rate: number | null; n_test: number; folds: number;
   fold_auc: (number | null)[]; edge: boolean; edge_note: string | null; calib_b: number | null;
+  // ranking heads ("beats the median stock"): the edge is judged by the daily rank IC
+  ic_se?: number | null; ic_t?: number | null; fold_ic?: (number | null)[]; spread?: number | null;
+  spread_t?: number | null; spread_periods?: number;
 }
+type NeuralModels = { neural: NeuralMetric; quantedge?: NeuralMetric; gbm?: NeuralMetric };
 export interface NeuralHorizonInfo {
   h: number; label: string; verdict: string;
-  metrics: { neural: NeuralMetric; quantedge?: NeuralMetric; gbm?: NeuralMetric };
+  metrics: NeuralModels;
   calibration?: { base: number; b: number } | null;
+  rank?: { metrics: NeuralModels; verdict: string; calibration?: { base: number; b: number } | null };
+}
+export interface NeuralTrade {
+  days: number; long_days: number; short_days: number; long_avg_net: number | null; short_avg_net: number | null;
+  ls_avg: number | null; ls_t: number | null; long_green_pct: number | null; short_green_pct: number | null;
+  long_top20_pct: number | null; ic: number | null; ic_t: number | null; ic_pos_pct: number | null;
+  universe_avg: number | null; cost_pct: number;
+}
+export interface NeuralIntradayInfo {
+  status: "ready" | "no_edge" | "missing" | "error";
+  error?: string; folder?: string; trained_at?: number; device?: string; rows?: number; days?: number;
+  params?: number; seeds?: number; symbols?: number; edge?: boolean; edge_note?: string | null; verdict?: string;
+  cost_pct?: number; top_n?: number; notes?: string[];
+  heads?: { head: "up" | "beat"; label: string; metrics: Record<string, NeuralMetric> }[];
+  trading?: Record<string, NeuralTrade>;
+  coverage?: { stocks: number; rows: number; days: number; first_day: string; last_day: string; liquid_rows: number };
+  evaluation?: { test_start: string; test_end: string; folds: string[][]; purge_days: number; baselines: string[] };
+  search?: { candidates: number; note: string; chosen_per_fold: { fold: number; hp: Record<string, number> }[] };
 }
 export interface NeuralInfo {
   status: "ready" | "computing" | "missing" | "error";
@@ -145,23 +167,24 @@ export interface NeuralInfo {
   trained_at?: number; device?: string; torch?: string; rows?: number; params?: number; seeds?: number;
   seq_len?: number; symbols?: number; epochs_median?: number;
   coverage?: { stocks: number; rows: number; fundamentals_stocks: number; fundamentals_rows: number;
-               quarterly_rows: number; news_rows: number; news_start: number | null };
+               quarterly_rows: number; news_rows: number; news_start: number | null; minute_rows?: number | null };
   notes?: string[];
   evaluation?: { test_start: string; test_end: string; folds: string[][]; purge_days: number; baselines: string[] };
   timing?: { neural_s: number; baselines_s: number; total_s: number };
   horizons?: NeuralHorizonInfo[];
   predicted_at?: number | null; as_of?: string | null;
 }
-export interface NeuralLeader { symbol: string; sector: string; p_up: number | null; close: number | null }
+export interface NeuralLeader { symbol: string; sector: string; p_up: number | null; p_beat?: number | null; close: number | null }
 export interface NeuralLeaderboard {
-  model: NeuralInfo; h: number; as_of?: string; ranked: boolean; n?: number; computing?: boolean;
-  verdict?: string; edge_note?: string | null; top: NeuralLeader[]; bottom: NeuralLeader[];
+  model: NeuralInfo; h: number; as_of?: string; ranked: boolean; ranked_by?: "up" | "beat" | null; n?: number;
+  computing?: boolean; verdict?: string; edge_note?: string | null; top: NeuralLeader[]; bottom: NeuralLeader[];
 }
 export interface NeuralResult {
   symbol: string; status: "ready" | "computing" | "missing" | "error"; as_of?: string; close?: number;
   sector?: string; model: NeuralInfo;
   horizons?: { h: number; label: string; p_up: number | null; edge: boolean; edge_note: string | null;
-               oos_auc: number | null; verdict: string; rank_pct: number | null }[];
+               oos_auc: number | null; verdict: string; rank_pct: number | null; p_beat?: number | null;
+               rank_edge?: boolean; rank_note?: string | null; oos_ic?: number | null; rank_verdict?: string | null }[];
   inputs?: { fundamentals: number; fundamentals_of: number; news_on: boolean };
 }
 
@@ -294,6 +317,7 @@ export const research = {
   neuralModel: () => api<NeuralInfo>("/api/research/neural-model"),
   neural: (symbol: string) => api<NeuralResult>(`/api/research/neural/${enc(symbol)}`),
   neuralLeaderboard: (h = 21, n = 15) => api<NeuralLeaderboard>(`/api/research/neural-leaderboard?h=${h}&n=${n}`),
+  neuralIntraday: () => api<NeuralIntradayInfo>("/api/research/neural-intraday-model"),
   screener: (symbol: string, refresh = false, view: "auto" | "consolidated" | "standalone" = "auto") =>
     api<Fundamentals>(`/api/research/screener/${enc(symbol)}?refresh=${refresh ? 1 : 0}&view=${view}`),
   aiConfig: () => api<AiConfig>("/api/research/ai-config"),

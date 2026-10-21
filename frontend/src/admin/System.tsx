@@ -16,6 +16,7 @@ interface SystemInfo {
 interface Card {
   date: string; ic: number | null; n_long: number; long_green: number; long_avg: number; universe_avg: number;
   excess_long: number; long_hits_top5: number; long_hits_top20: number; picks: string[];
+  neural?: { picks: string[]; shorts: string[]; ic: number | null; long_avg: number | null; short_avg: number | null; excess_long: number | null };
 }
 interface Scorecard {
   cards: Card[];
@@ -450,7 +451,7 @@ export default function SystemDesk() {
         )}
         {!sc?.cards.length ? <Empty>The first scorecard is written automatically at 15:30 on a day the picks were locked.</Empty> : (
           <table className="tbl">
-            <thead><tr><th className="l">Date</th><th>IC</th><th>Long avg</th><th>Universe</th><th>Excess</th><th>Top-5</th><th>Top-20</th><th>Green</th><th className="l">Picks</th></tr></thead>
+            <thead><tr><th className="l">Date</th><th>IC</th><th>Long avg</th><th>Universe</th><th>Excess</th><th>Top-5</th><th>Top-20</th><th>Green</th><th className="l">Picks</th><th title="the 09:30 neural model's long picks: average lock → close, and its rank IC">Neural</th></tr></thead>
             <tbody>
               {sc.cards.map((c) => (
                 <tr key={c.date} style={{ cursor: "default" }}>
@@ -461,6 +462,8 @@ export default function SystemDesk() {
                   <td className={cls(c.excess_long)}>{signed(c.excess_long)}%</td>
                   <td>{c.long_hits_top5}</td><td>{c.long_hits_top20}</td><td>{c.long_green}/{c.n_long}</td>
                   <td className="l muted">{c.picks.join(", ")}</td>
+                  <td className={c.neural ? cls(c.neural.long_avg ?? 0) : "muted"} title={c.neural ? `${c.neural.picks.join(", ")} · IC ${c.neural.ic ?? "—"}` : "no neural picks that day"}>
+                    {c.neural && c.neural.long_avg !== null ? `${signed(c.neural.long_avg)}%` : "—"}</td>
                 </tr>
               ))}
             </tbody>

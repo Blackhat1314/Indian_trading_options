@@ -519,7 +519,28 @@ async def scorecard(user: str = Depends(auth)):
         "pct_green": round(sum(c.get("long_green", 0) for c in cards) /
                            max(1, sum(c.get("n_long", 0) for c in cards)) * 100, 1),
     }
-    return {"cards": cards, "summary": summary}
+    return {"cards": cards, "summary": summary, "neural_summary": _neural_summary(cards)}
+
+
+def _neural_summary(cards: list[dict]) -> dict | None:
+    """The 09:30 neural picks' live record, next to the TOP5's on the same days (a paired comparison)."""
+    nc = [c for c in cards if isinstance(c.get("neural"), dict)]
+    if not nc:
+        return None
+
+    def avg(xs):
+        xs = [x for x in xs if isinstance(x, (int, float))]
+        return round(sum(xs) / len(xs), 4) if xs else None
+    n_ic = [c["neural"].get("ic") for c in nc]
+    return {"days": len(nc),
+            "neural": {"mean_ic": avg(n_ic), "ic_positive_days": sum(1 for x in n_ic if isinstance(x, (int, float)) and x > 0),
+                       "avg_long": avg(c["neural"].get("long_avg") for c in nc),
+                       "avg_short": avg(c["neural"].get("short_avg") for c in nc),
+                       "avg_excess": avg(c["neural"].get("excess_long") for c in nc),
+                       "top5_hits_per_day": avg(c["neural"].get("long_hits_top5") for c in nc)},
+            "top5": {"mean_ic": avg(c.get("ic") for c in nc), "avg_long": avg(c.get("long_avg") for c in nc),
+                     "avg_short": avg(c.get("short_avg") for c in nc), "avg_excess": avg(c.get("excess_long") for c in nc),
+                     "top5_hits_per_day": avg(c.get("long_hits_top5") for c in nc)}}
 
 
 class AlertIn(BaseModel):
