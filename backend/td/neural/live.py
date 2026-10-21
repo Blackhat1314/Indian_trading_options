@@ -9,6 +9,9 @@
   beta, usual-volume curve — the same load_context numbers the training rows were built with) and NIFTY's bars.
   td.neural.intraday.day_features turns them into the network's inputs exactly as in training.
 - A model without a measured edge makes no picks (its verdict says why); the TOP5 stays in charge either way.
+- The training chose what scores the picks (meta["deploy"]): the network, gradient-boosted trees (intraday-gbm.json,
+  evaluated with numpy by td.neural.trees — no scikit-learn here) or their blend. All three read the same 09:30
+  inputs (td.neural.intraday.flat_inputs for the trees).
 - A stock is skipped when its daily history is a day behind the others or the feed's previous close disagrees with
   the lake's by more than 0.5 % (a split or bonus the bars don't adjust for).
 """
@@ -120,6 +123,7 @@ class LiveIntraday:
         self.folder = Path(folder) if folder else None
         self.meta: dict | None = None
         self.sess = None
+        self.gbm: dict | None = None
         self.error: str | None = None
         self._stamp = None
         self._checked = 0.0
@@ -148,6 +152,14 @@ class LiveIntraday:
             so.intra_op_num_threads = 1
             so.inter_op_num_threads = 1
             self.sess = ort.InferenceSession(str(onnx_p), sess_options=so, providers=["CPUExecutionProvider"])
+            dep = meta.get("deploy") or {}
+            self.gbm = None
+            if dep.get("model") in ("gbm", "blend"):
+                gp = onnx_p.with_name(dep.get("gbm_file") or "intraday-gbm.json")
+                if not gp.exists():
+                    raise FileNotFoundError(f"{gp.name} is missing — the 09:30 model was trained to use the trees; "
+                                            "upload it with intraday.onnx and intraday.json")
+                self.gbm = json.loads(gp.read_text())
             self.meta, self.error, self.ctx = meta, None, None
             log.info("09:30 model loaded (trained %s, edge %s)",
                      time.strftime("%Y-%m-%d %H:%M", time.localtime(meta["trained_at"])), meta.get("edge"))
@@ -169,7 +181,8 @@ class LiveIntraday:
     def summary(self) -> dict:
         m = self.meta or {}
         return {"status": self.state, "error": self.error, "trained_at": m.get("trained_at"),
-                "verdict": m.get("verdict"), "edge": bool(m.get("edge")), "edge_note": m.get("edge_note")}
+                "verdict": m.get("verdict"), "edge": bool(m.get("edge")), "edge_note": m.get("edge_note"),
+                "uses": (m.get("deploy") or {}).get("model", "neural") if m else None}
 
     # ------------------------------------------------------------------ context before the open
     def ready_for(self, day: date) -> bool:
@@ -243,10 +256,12 @@ class LiveIntraday:
             return {"status": "error", "note": f"only {k} stocks had enough 1-minute bars by 09:30"}
         seq = np.stack([rows[s][0] for s in res["sym"]]).astype(np.float32)
         static = np.stack([rows[s][1] for s in res["sym"]]).astype(np.float32)
-        p = sess.run(["p"], {"seq": seq, "static": static, "bars": res["bars"], "intra": res["intra"]})[0]
+        p = self.raw(seq, static, res["bars"], res["intra"])
         from ..research import quant as qm
-        for hi, hz in enumerate(meta["heads"]):
-            cal = hz.get("calibration") or {}
+        dep = meta.get("deploy") or {}
+        cals = dep.get("calibration") or [hz.get("calibration") or {} for hz in meta["heads"]]
+        for hi in range(p.shape[1]):
+            cal = cals[hi] or {}
             p[:, hi] = qm.calib_apply(p[:, hi].astype(float), cal.get("base", 0.5), cal.get("b", 1.0))
         from ..universe_data import SECTOR_OF
         sectors = np.array([SECTOR_OF.get(s, "OTHER") for s in res["sym"]])
@@ -257,6 +272,19 @@ class LiveIntraday:
                 "long": [res["sym"][i] for i in lo], "short": [res["sym"][i] for i in sh],
                 "p": {s: [f(p[i, 0]), f(p[i, 1])] for i, s in enumerate(res["sym"])},
                 **{key: v for key, v in self.summary().items() if key not in ("error", "status")}}
+
+    def raw(self, seq: np.ndarray, static: np.ndarray, bars: np.ndarray, intra: np.ndarray) -> np.ndarray:
+        """(n, 2) uncalibrated probabilities of the deployed model: the network, the trees or their mean."""
+        model = ((self.meta or {}).get("deploy") or {}).get("model", "neural")
+        p_nn = None
+        if model in ("neural", "blend"):
+            p_nn = self.sess.run(["p"], {"seq": seq, "static": static, "bars": bars, "intra": intra})[0].astype(float)
+        if model == "neural":
+            return p_nn
+        from . import trees
+        X = it.flat_inputs(seq, static, bars, intra)
+        p_gb = np.column_stack([trees.predict_proba(self.gbm[h], X) for h in it.HEADS])
+        return p_gb if model == "gbm" else (p_nn + p_gb) / 2
 
     def close(self) -> None:
         if self._pool is not None:

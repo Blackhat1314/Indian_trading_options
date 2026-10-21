@@ -219,14 +219,87 @@ def _cfg(**kw):
     return tr.TrainConfig(**{**base, **kw})
 
 
-def test_noise_has_no_edge_and_no_picks(noise_panel):
+def test_noise_has_no_edge_and_no_picks(noise_panel, tmp_path):
     pytest.importorskip("torch")
+    pytest.importorskip("onnx")
     from td.neural import train_intraday as ti
-    ens, meta = ti.train(noise_panel, _cfg())
+    from td.neural.live import LiveIntraday
+    ens, meta = ti.train(noise_panel, _cfg(gbm=True))
     assert meta["edge"] is False and "no neural picks" in meta["verdict"]
     assert {h["head"] for h in meta["heads"]} == set(it.HEADS)
-    assert set(meta["trading"]) >= {"neural", "ranker", "linear"}
-    assert json.dumps(meta, allow_nan=False)
+    assert set(meta["trading"]) >= {"neural", "ranker", "linear", "gbm", "blend", "selected"}
+    dep = meta["deploy"]
+    assert dep["model"] in ti.DEPLOYABLE and dep["judged_on"] == "selected"
+    assert [t["fold"] for t in dep["selection"]] == list(range(2, len(noise_panel.folds) + 1))
+    assert (dep["gbm_file"] is not None) == (dep["model"] in ("gbm", "blend"))
+    files = ti.export(ens, noise_panel, meta, tmp_path)
+    assert len(files) == (3 if dep["gbm_file"] else 2)
+    saved = json.loads((tmp_path / "intraday.json").read_text())
+    assert "_gbm" not in saved and saved["deploy"]["model"] == dep["model"]
+    nn = LiveIntraday(folder=tmp_path)
+    nn.load()
+    assert nn.error is None and nn.state == "no_edge" and (nn.gbm is not None) == bool(dep["gbm_file"])
+
+
+def test_tree_export_matches_sklearn():
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    from td.neural import trees
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(4000, 30)).astype(np.float32)
+    X[::13, 4] = np.nan                                         # missing values follow the learnt direction
+    y = (np.nan_to_num(X[:, 0]) + 0.6 * X[:, 1] * X[:, 2] + rng.normal(size=4000) > 0).astype(int)
+    clf = HistGradientBoostingClassifier(max_iter=80, max_leaf_nodes=15, min_samples_leaf=100,
+                                         early_stopping=False, random_state=0).fit(X, y)
+    m = json.loads(json.dumps(trees.export_hgb(clf)))           # through JSON, as on the server
+    assert np.abs(trees.predict_proba(m, X) - clf.predict_proba(X)[:, 1]).max() < 1e-9
+    with pytest.raises(ValueError, match="inputs"):
+        trees.predict_proba(m, X[:, :10])
+
+
+def test_best_model_is_chosen_on_earlier_folds_only(noise_panel):
+    """The choosing rule is walked forward: a model that only shone in fold 1 is chosen for fold 2 (and its bad
+    fold 2 counts against the rule), then the steadily better one takes over."""
+    from td.neural import train_intraday as ti
+    IP = noise_panel
+    rng = np.random.default_rng(1)
+    preds = {"neural": [], "gbm": [], "blend": []}
+    for k, (s, e) in enumerate(IP.folds):
+        te = np.flatnonzero((IP.row_cal >= s) & (IP.row_cal < e))
+        r = IP.ret_pct[te]
+        good, bad, mid = r, -r, r + rng.normal(0, 3 * r.std(), r.size)
+        sig = lambda v: 1 / (1 + np.exp(-v))                     # noqa: E731
+        base = np.array([0.5, 0.5])
+        preds["neural"].append((k, te, np.column_stack([sig(good if k == 0 else bad)] * 2), base))
+        preds["gbm"].append((k, te, np.column_stack([sig(mid if k == 0 else good)] * 2), base))
+        preds["blend"].append((k, te, np.column_stack([sig(rng.normal(size=r.size))] * 2), base))
+    sel, trail, final, ls = ti.select(IP, preds)
+    assert [t["chosen"] for t in trail] == ["neural"] + ["gbm"] * (len(IP.folds) - 2)
+    assert final == "gbm" and ls["neural"][1] < 0 < ls["gbm"][1]
+    assert len(sel["tests"]) == len(IP.folds) - 1 and sel["parts"]["beat"][0][2] == 1   # fold 2 = neural's bad one
+    single, trail1, final1, _ = ti.select(IP, {"neural": preds["neural"]})
+    assert trail1 == [] and final1 == "neural" and not single["tests"]
+
+
+def test_live_blend_averages_the_network_and_the_trees(noise_panel):
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    from td.neural import trees
+    from td.neural.live import LiveIntraday
+    from td.neural.train_intraday import IntradayTask, flat
+    IP = noise_panel
+    rows = np.arange(0, IP.rows, 7)
+    X = flat(IP, rows)
+    gbm = {h: trees.export_hgb(HistGradientBoostingClassifier(max_iter=20, random_state=0).fit(X, (IP.fwd[rows, i] > 0)))
+           for i, h in enumerate(it.HEADS)}
+    nn = LiveIntraday()
+    nn.sess, nn.gbm = _Sess(), gbm
+    nn.meta = {"deploy": {"model": "blend"}}
+    x = IntradayTask(IP).inputs(rows[:50])
+    want = (0.5 + np.column_stack([trees.predict_proba(gbm[h], X[:50]) for h in it.HEADS])) / 2
+    assert np.allclose(nn.raw(*x), want)
+    nn.meta = {"deploy": {"model": "gbm"}}
+    assert np.allclose(nn.raw(*x), want * 2 - 0.5)
 
 
 def test_planted_pattern_is_found_and_beats_the_ranker(tmp_path):
@@ -242,8 +315,8 @@ def test_planted_pattern_is_found_and_beats_the_ranker(tmp_path):
     assert nn["ls_avg"] > 0 and nn["ic"] > rkr["ic"]
     assert meta["edge"] is True and meta["verdict"].startswith("beats")
     assert len(meta["search"]["chosen_per_fold"]) == len(IP.folds) and meta["search"]["candidates"] == 2
-    onnx_p, meta_p = ti.export(ens, IP, meta, tmp_path)
-    assert json.loads(meta_p.read_text())["onnx_check_max_diff"] < 1e-4
+    files = ti.export(ens, IP, meta, tmp_path)
+    assert json.loads(files[1].read_text())["onnx_check_max_diff"] < 1e-4
 
 
 # ------------------------------------------------------------------ live 09:30 scoring == training rows

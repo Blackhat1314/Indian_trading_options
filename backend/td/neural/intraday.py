@@ -459,6 +459,13 @@ def build(frames: dict[str, pd.DataFrame], index_df: pd.DataFrame | None, tables
                   test_start=test_start, coverage=cover, notes=notes, weights=dict(cfg.weights))
 
 
+# --------------------------------------------------------------------------- one row of numbers (trees, linear)
+def flat_inputs(seq: np.ndarray, static: np.ndarray, bars: np.ndarray, intra: np.ndarray) -> np.ndarray:
+    """The network's four inputs as one row of numbers per stock — what the linear and tree models read. Built
+    from the same arrays in training and live, so both see identical numbers."""
+    return np.hstack([seq[:, -1, :], static, intra, bars[:, -1, :], bars[:, :, 3], bars[:, :, 4]]).astype(np.float32)
+
+
 # --------------------------------------------------------------------------- picks from scores
 def top_bottom(score: np.ndarray, liquid: np.ndarray, sector: np.ndarray, n: int = TOP_N,
                per_sector: int = MAX_PER_SECTOR) -> tuple[np.ndarray, np.ndarray]:
