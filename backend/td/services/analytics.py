@@ -412,7 +412,8 @@ class Engine:
                     live.append(q)
                 out[side] = live
             # how the picks rank vs everything since the lock
-            out["universe_since_lock"] = self._since_lock_stats()
+            # empty right after a restart, until the first prices arrive: send null, not {}
+            out["universe_since_lock"] = self._since_lock_stats() or None
             return out
         dt = from_epoch(self.clock)
         closed = holiday_name(dt.date()) or self.top.get("closed")

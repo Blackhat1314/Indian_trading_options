@@ -57,7 +57,7 @@ export interface TopSnap {
   locked: boolean; provisional?: boolean; missed?: boolean; closed?: string; date?: string; lock_ts?: number; lock_time: string;
   seconds_to_lock?: number; long: Pick[]; short: Pick[];
   abstained?: { long: number; short: number };
-  universe_since_lock?: {
+  universe_since_lock?: null | {
     universe_avg: number; long_avg: number; short_avg: number; long_hits_top5: number; long_hits_top20: number;
     short_hits_bottom5: number; leaders: { symbol: string; ret: number }[]; laggards: { symbol: string; ret: number }[];
   };
