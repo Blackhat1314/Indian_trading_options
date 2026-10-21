@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 from .. import bus
 from ..config import settings
 from ..dhan.instruments import Instrument, Universe
+from ..holidays import is_trading_day
 from ..lake import Lake, bars_from_dhan
 from ..ratelimit import BudgetExhausted
 from ..timeutil import IST, from_epoch, minute_of_session, now_ist
@@ -97,7 +98,7 @@ class HistoryBootstrap:
             start = today - timedelta(days=settings.auto_history_days)
             if last is not None:
                 start = max(start, from_epoch(last).date() + timedelta(days=1))
-            while start < today and start.weekday() >= 5:      # nothing new over a weekend
+            while start < today and not is_trading_day(start):  # nothing new over a weekend or holiday
                 start += timedelta(days=1)
             if start < today:
                 payload = await self._call(self.rest.daily(i.sid, seg, kind, start, today))

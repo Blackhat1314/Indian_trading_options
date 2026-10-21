@@ -187,7 +187,7 @@ def factor_chips(r: dict, side: str = "long") -> list[str]:
     if sgn * r["news"] > 0.15:
         chips.append(r["news_type"] or "NEWS")
     if sgn * r["resid"] > 1:
-        chips.append("RS")
+        chips.append("RS" if side == "long" else "RW")      # relative strength / relative weakness vs NIFTY
     return chips
 
 

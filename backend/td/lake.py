@@ -143,6 +143,16 @@ class Lake:
         _, _, last = file_stats(p)
         return last
 
+    def first_ts(self, interval: str, symbol: str) -> int | None:
+        p = self.path(interval, symbol)
+        if not p.exists():
+            return None
+        try:
+            _, first, _ = file_stats(p)
+        except (OSError, ValueError, pa.ArrowException):       # being replaced right now
+            return None
+        return first
+
     def coverage(self) -> list[dict]:
         """Rows / first / last per interval and symbol, from Parquet footers (no data pages are read)."""
         out = []

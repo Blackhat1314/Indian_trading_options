@@ -16,6 +16,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -35,6 +36,7 @@ from ..analytics import alerts as alerts_mod
 from ..analytics import smc
 from ..config import ROOT, settings
 from ..dhan.token import TokenError, TokenKeeper
+from ..holidays import holiday_name
 from ..lake import Lake
 from ..timeutil import IST, MARKET_OPEN, at, from_epoch
 
@@ -484,10 +486,22 @@ async def research_intraday(user: str = Depends(auth)):
     return d
 
 
+def _real_session(card: dict) -> bool:
+    """False for a scorecard recorded on a day nothing traded (a holiday the app didn't know, before the holiday
+    list): no picks and every return exactly zero. Those would drag every average toward zero."""
+    try:
+        if holiday_name(date.fromisoformat(str(card.get("date")))):
+            return False
+    except ValueError:
+        pass
+    flat = all(not card.get(k) for k in ("universe_avg", "long_avg", "short_avg"))
+    return not (flat and not card.get("picks") and not card.get("shorts"))
+
+
 @app.get("/api/scorecard")
 async def scorecard(user: str = Depends(auth)):
     raw = await app.state.redis.lrange(bus.KEY_SCORECARD, 0, 249)
-    cards = [bus.loads(x) for x in raw]
+    cards = [c for c in (bus.loads(x) for x in raw) if _real_session(c)]
     if not cards:
         return {"cards": [], "summary": None}
     n = len(cards)

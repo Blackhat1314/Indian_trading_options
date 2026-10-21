@@ -19,7 +19,8 @@ function PickRow({ p, i, side, locked, selected }: { p: Pick; i: number; side: "
         <span className="pick-sym">{p.symbol}<small>{p.sector}</small><small>score {p.score.toFixed(2)}</small></span>
         <span className="chips pick-chips">
           {p.chips.slice(0, 6).map((c) => (
-            <span key={c} className={`chip ${c === "LB" || c === "ORB" || c === "VWAP+" ? "up" : c === "SB" || c === "ORBD" || c === "VWAP-" ? "down" : c.startsWith("RVOL") ? "amber" : c === "RS" ? "cyan" : "violet"}`}>{c}</span>
+            <span key={c} className={`chip ${c === "LB" || c === "ORB" || c === "VWAP+" ? "up" : c === "SB" || c === "ORBD" || c === "VWAP-" ? "down" : c.startsWith("RVOL") ? "amber" : c === "RS" || c === "RW" ? "cyan" : "violet"}`}
+              title={c === "RS" ? "Relative strength: up more than its beta × NIFTY" : c === "RW" ? "Relative weakness: down more than its beta × NIFTY" : undefined}>{c}</span>
           ))}
         </span>
         {p.headline && <span className="pick-head-line ellipsis" title={p.headline}>{p.headline}</span>}
@@ -30,8 +31,9 @@ function PickRow({ p, i, side, locked, selected }: { p: Pick; i: number; side: "
           {pct(main, 2)}
           <small>{locked ? `@${px(p.entry)} → ${px(p.ltp)}` : `ltp ${px(p.ltp)}`}</small>
         </span>
-        <span className={`pick-status ${status}`} style={{ display: "block", marginTop: 3 }}>
-          {status === "PROV" ? "PROVISIONAL" : status}
+        <span className={`pick-status ${status}`} style={{ display: "block", marginTop: 3 }}
+          title={status === "TARGET" ? `target ${px(p.target)} reached` : status === "INVALID" ? `stop ${px(p.invalidation)} hit` : `target ${px(p.target)} · stop ${px(p.invalidation)}`}>
+          {status === "PROV" ? "PROVISIONAL" : status}{p.hit_at && status !== "LIVE" ? ` ${p.hit_at}` : ""}
         </span>
       </span>
     </button>
@@ -48,14 +50,16 @@ function TopPicks() {
   const ss = String((top.seconds_to_lock ?? 0) % 60).padStart(2, "0");
   const sub = top.locked
     ? `locked ${top.lock_time} IST · tracking from entry`
-    : top.missed
+    : top.closed
+      ? `market closed — ${top.closed} · no picks today`
+      : top.missed
       ? `missed today's ${top.lock_time} lock (no ranking at lock time) · live ranking, not scored`
       : (top.seconds_to_lock ?? 0) > 0
         ? `provisional · locks at ${top.lock_time} IST (in ${mm}:${ss})`
         : `provisional · locking as soon as the ranking is ready`;
   return (
     <Panel code="TOP5" title="Intraday picks" sub={sub} area="picks" id="picks" className="picks-panel"
-      actions={top.locked ? <span className="chip up">LOCKED</span> : <span className="chip amber">LIVE RANKING</span>}
+      actions={top.locked ? <span className="chip up">LOCKED</span> : top.closed ? <span className="chip">CLOSED</span> : <span className="chip amber">LIVE RANKING</span>}
       foot={top.locked && u ? (
         <div className="lockbar" aria-label="Performance since lock">
           <span className="amber b">SINCE LOCK</span>
@@ -76,7 +80,9 @@ function TopPicks() {
                 <span className={side === "long" ? "up b" : "down b"}>{side === "long" ? "▲ LONG — continuation up" : "▼ SHORT — continuation down"}</span>
                 <span className="muted" style={{ marginLeft: "auto" }}>{list.length}/{5}</span>
               </div>
-              {list.length === 0 && <Empty>{ranked === 0
+              {list.length === 0 && <Empty>{top.closed
+                ? `No picks: ${top.closed}.`
+                : ranked === 0
                 ? "No ranking yet — waiting for previous closes and history (live mode loads them from Dhan automatically, a few minutes after start; admins see progress under /admin → SYSTEM)."
                 : "No stock passes the filters yet — the system abstains rather than force a pick."}</Empty>}
               {list.map((p, i) => <PickRow key={p.symbol} p={p} i={i} side={side} locked={top.locked} selected={selected === p.symbol} />)}

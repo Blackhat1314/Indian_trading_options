@@ -29,6 +29,7 @@ from .. import backfill as bf
 from ..config import settings
 from ..dhan.rest import DhanRest
 from ..dhan.token import TokenKeeper
+from ..holidays import is_trading_day
 from ..lake import Lake
 from ..ratelimit import DailyBudget
 from ..timeutil import IST, now_ist
@@ -199,7 +200,7 @@ class Backfiller:
     # ------------------------------------------------------------ pacing
     async def _pause_reason(self) -> str | None:
         now = now_ist()
-        if now.weekday() < 5:
+        if is_trading_day(now.date()):
             t = now.timetz().replace(tzinfo=None)
             if PREMARKET[0] <= t < PREMARKET[1]:
                 return "pre-market: the live app refreshes its own history at 08:40 IST"
@@ -215,7 +216,7 @@ class Backfiller:
     def _in_market(self) -> bool:
         now = now_ist()
         t = now.timetz().replace(tzinfo=None)
-        return now.weekday() < 5 and MARKET[0] <= t < MARKET[1]
+        return is_trading_day(now.date()) and MARKET[0] <= t < MARKET[1]
 
     async def _gate(self) -> float:
         """Awaited before every request: pauses while the live app needs Dhan, returns the rate to use now."""
@@ -321,7 +322,9 @@ class Backfiller:
             return {"error": "the instrument list is not available yet (is the ingestor running?)"}
         tg = bf.targets(uni, set(spec.symbols) or None)
         today = now_ist().date()
-        jobs = bf.make_jobs(tg, spec.intervals, spec.years, today, bf.coverage_from_state(bf.load_state(), today))
+        st = bf.load_state()
+        jobs = bf.make_jobs(tg, spec.intervals, spec.years, today, bf.coverage_from_state(st, today),
+                            floor=await asyncio.to_thread(bf.listing_floor, st, self.lake, today))
         out = bf.summarize(jobs, await self.budget.remaining(), spec.reserve, spec.rate)
         out["symbols"] = len(tg)
         out["unknown"] = sorted(set(spec.symbols) - {t.symbol for t in tg})
@@ -360,7 +363,8 @@ class Backfiller:
             st = bf.compact(bf.load_state(), today)
             bf.save_state(st)
             tg = bf.targets(uni, set(job.symbols) or None)
-            jobs = bf.make_jobs(tg, job.intervals, job.years, today, bf.coverage_from_state(st, today))
+            jobs = bf.make_jobs(tg, job.intervals, job.years, today, bf.coverage_from_state(st, today),
+                                floor=await asyncio.to_thread(bf.listing_floor, st, self.lake, today))
             if not jobs:
                 self._done(job, "complete", bf.Progress())
                 return
@@ -396,6 +400,9 @@ class Backfiller:
             job.active = False
             bf.save_job(job)
             msg = f"pull complete — {prog.ok} requests with data, {prog.empty} empty, {prog.rows:,} rows"
+            if prog.before_history:
+                msg += (f" ({prog.before_history} of the empty ones are older than the stock's history — listed later "
+                        "or past Dhan's 5-year archive — and are not asked for again)")
             if prog.failed:
                 msg += f"; {prog.failed} failed (Start again to retry them)"
             log.info(msg)

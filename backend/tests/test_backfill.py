@@ -437,3 +437,69 @@ def test_worker_keeps_the_newer_job(monkeypatch, tmp_path):
         w._done(old, "complete", bf.Progress())                                 # the old run finishing
         assert w.job.intervals == ["1"] and w.job.active and bf.load_job().intervals == ["1"]
     run(go())
+
+
+# --------------------------------------------------------------- stocks with a shorter history than the window
+NEWCO = [{"sid": 7001, "seg": "NSE_EQ", "symbol": "NEWCO", "kind": "EQ"}]
+
+
+class Since(FakeRest):
+    """Dhan with bars only from `first` (daily and intraday) for every symbol — like a stock listed that day, or
+    one whose intraday archive starts there (`daily_from` lets daily bars start earlier)."""
+
+    def __init__(self, first: date, daily_from: date | None = None, hole: tuple[date, date] | None = None, **kw):
+        super().__init__(**kw)
+        self.first, self.daily_from, self.hole = first, daily_from or first, hole
+
+    async def daily(self, sid, seg, kind, start, end, oi=False, expiry_code=None, retries=3):
+        self.calls.append(("D", sid, start, end))
+        self.data_budget.left -= 1
+        return self._bars(max(start, self.daily_from), min(end, TODAY), 1)
+
+    async def intraday(self, sid, seg, kind, interval, start, end, oi=False, retries=3):
+        self.calls.append(("1", sid, start.date(), end.date()))
+        self.data_budget.left -= 1
+        s, e = start.date(), min(end.date() + timedelta(days=1), TODAY)
+        if self.hole and s < self.hole[1] and e > self.hole[0]:
+            return {}                                        # a bar-less answer in the middle of the history
+        return self._bars(max(s, self.first), e, 3) if e > self.first else {}
+
+
+def test_stock_listed_later_is_not_failed_or_asked_again(tmp_path):
+    lake, listed = Lake(tmp_path / "lake"), date(2025, 3, 3)
+    st = {"done": {}, "empty": {}, "failed": {}}
+    jobs = bf.make_jobs(bf.targets(NEWCO), ["D", "1"], 5, TODAY)
+    rest = Since(listed)
+    # first pull: the daily request (one call, first in the queue) shows the listing day; every intraday range
+    # before it comes back empty and is recorded as covered instead of failing on every run
+    _, prog = run(bf.run_jobs(jobs, rest, lake, st, today=TODAY, rate=50, concurrency=1, save=lambda s: None))
+    before = [j for j in jobs if j.interval == "1" and date.fromisoformat(j.end) <= listed]
+    assert before and prog.failed == 0 and prog.before_history == len(before)
+    assert prog.ok == len(jobs) - len(before)
+    # the plan knows the listing day: nothing is asked for again — and a fresh state still skips it
+    assert bf.listing_floor(st, lake, TODAY) == {"NEWCO": listed}
+    assert bf.make_jobs(bf.targets(NEWCO), ["D", "1"], 5, TODAY, bf.coverage_from_state(st, TODAY)) == []
+    fresh = bf.make_jobs(bf.targets(NEWCO), ["1"], 5, TODAY, floor=bf.listing_floor(st, lake, TODAY))
+    assert fresh and min(date.fromisoformat(j.start) for j in fresh) == listed
+
+
+def test_old_stock_past_the_intraday_archive_is_recorded(tmp_path):
+    lake = Lake(tmp_path / "lake")
+    jobs = bf.make_jobs(bf.targets(NEWCO), ["1"], 5, TODAY)
+    oldest = jobs[-1]                                        # newest first: the last job is the window's oldest chunk
+    st = {"done": {}, "empty": {}, "failed": {}}
+    rest = Since(date.fromisoformat(oldest.end), daily_from=TODAY - timedelta(days=4000))
+    _, prog = run(bf.run_jobs(jobs, rest, lake, st, today=TODAY, rate=50, concurrency=1, save=lambda s: None))
+    assert prog.failed == 0 and prog.before_history == 1 and oldest.key in st["empty"]
+
+
+def test_empty_range_inside_the_history_still_fails(tmp_path):
+    """A stock that was trading (daily bars) answering an empty middle range is suspicious: retried next run."""
+    lake = Lake(tmp_path / "lake")
+    jobs = bf.make_jobs(bf.targets(NEWCO), ["D", "1"], 5, TODAY)
+    mid = [j for j in jobs if j.interval == "1"][6]                       # ~1.5 years back
+    hole = (date.fromisoformat(mid.start), date.fromisoformat(mid.end))
+    st = {"done": {}, "empty": {}, "failed": {}}
+    rest = Since(TODAY - timedelta(days=4000), hole=hole)
+    _, prog = run(bf.run_jobs(jobs, rest, lake, st, today=TODAY, rate=50, concurrency=1, save=lambda s: None))
+    assert prog.failed == 1 and list(st["failed"]) == [mid.key] and prog.before_history == 0
