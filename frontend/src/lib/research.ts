@@ -160,6 +160,8 @@ export interface NeuralIntradayInfo {
   coverage?: { stocks: number; rows: number; days: number; first_day: string; last_day: string; liquid_rows: number };
   evaluation?: { test_start: string; test_end: string; folds: string[][]; purge_days: number; baselines: string[] };
   search?: { candidates: number; note: string; chosen_per_fold: { fold: number; hp: Record<string, number> }[] };
+  deploy?: { model: string; selection: { fold: number; chosen: string; on_folds: number[] }[];
+             fold_ls: Record<string, (number | null)[]>; judged_on: string };
 }
 export interface NeuralInfo {
   status: "ready" | "computing" | "missing" | "error";

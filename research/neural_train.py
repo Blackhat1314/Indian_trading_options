@@ -5,7 +5,8 @@
                      → data/neural/training-data-YYYYMMDD.zip   (download it)
   2. on the PC:      python research/neural_train.py --data C:\\path\\training-data-20261021.zip --fetch-fundamentals
                      → <data folder>/neural/model.onnx + model.json        (daily model: 1 day, 1 week, 1 month)
-                       <data folder>/neural/intraday.onnx + intraday.json  (09:30 → close model)
+                       <data folder>/neural/intraday.onnx + intraday.json  (09:30 → close model; + intraday-gbm.json
+                                                                           when the walk-forward chose the trees)
   3. upload the files to the server's data/neural/ folder; the NEURAL desk picks them up within a minute, the
      09:30 picks start the next trading morning.
 
@@ -162,14 +163,24 @@ def intraday_table(meta: dict) -> str:
     rows = [f"{'model':<9}{'AUC beat':>9}{'IC':>8}{'± SE':>7}{'long':>9}{'short':>9}{'L/S':>9}{'t':>6}"
             f"{'green':>7}   (09:30 → close, % net of {meta['cost_pct']:.2f}% costs, test days only)"]
     beat = next(h for h in meta["heads"] if h["head"] == "beat")["metrics"]
-    for name in ("neural", "ranker", "linear", "gbm"):
+    for name in ("neural", "ranker", "linear", "gbm", "blend", "selected"):
         m, t = beat.get(name), (meta.get("trading") or {}).get(name)
         if not m or not t:
             continue
+        if name == "selected":
+            rows.append("")
         rows.append(f"{name:<9}{_n(m.get('auc'), '.3f'):>9}{_n(t.get('ic'), '+.3f'):>8}{_n(m.get('ic_se'), '.3f'):>7}"
                     f"{_n(t.get('long_avg_net'), '+.3f'):>9}{_n(t.get('short_avg_net'), '+.3f'):>9}"
                     f"{_n(t.get('ls_avg'), '+.3f'):>9}{_n(t.get('ls_t'), '.1f'):>6}"
                     f"{_n(t.get('long_green_pct'), '.0f'):>6}%")
+    dep = meta.get("deploy") or {}
+    if dep.get("selection"):
+        trail = ", ".join(f"fold {s['fold']} → {s['chosen']}" for s in dep["selection"])
+        rows.append(f"\nselected = each fold scored by the model that did best on the folds before it ({trail})")
+        ls = dep.get("fold_ls") or {}
+        rows.append("long/short per fold: " + " · ".join(
+            f"{n} " + "/".join(_n(v, '+.3f') for v in vals) for n, vals in ls.items()))
+    rows.append(f"deployed: {dep.get('model', 'neural')}  (the same rule with every fold seen)")
     rows.append(f"\nverdict: {meta['verdict']}")
     if meta.get("edge_note"):
         rows.append(f"         {meta['edge_note']}")
@@ -265,7 +276,7 @@ def main() -> None:
     print(f"\ntrained in {(time.time() - t0) / 60:.1f} min")
     print("\nmodel files:\n" + "\n".join(f"  {p}" for p in written))
     print("\nnext: upload them to the server's data/neural/ folder (the NEURAL desk loads them within a minute; "
-          "the 09:30 picks start the next trading morning).")
+          "the 09:30 picks start the next trading morning):  sudo mv ~/model.* ~/intraday* ~/tradedesk/data/neural/")
 
 
 if __name__ == "__main__":

@@ -214,6 +214,9 @@ class NeuralService:
         out["symbols"] = len(m.get("symbols") or [])
         if out.get("search"):
             out["search"] = {k: v for k, v in out["search"].items() if k != "final"}
+        dep = m.get("deploy") or {}
+        out["deploy"] = {"model": dep.get("model", "neural"), "selection": dep.get("selection") or [],
+                         "fold_ls": dep.get("fold_ls") or {}, "judged_on": dep.get("judged_on", "neural")}
         out["status"] = "ready" if m.get("edge") else "no_edge"
         return out
 

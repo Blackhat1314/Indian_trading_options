@@ -27,7 +27,7 @@ const pctOf = (p: number | null | undefined, d = 0) => (ok(p) ? `${fx(p * 100, d
 const NO_LEAN: [number, number] = [0, 1];
 const MODEL_NAME: Record<string, string> = {
   neural: "NeuralEdge", quantedge: "QuantEdge (logistic)", gbm: "Gradient boosting", ranker: "TOP5 ranker (live)",
-  linear: "Logistic (same inputs)",
+  linear: "Logistic (same inputs)", blend: "Network + trees", selected: "Chosen walk-forward",
 };
 const sgn = (v: number | null | undefined, d = 2) => (ok(v) ? `${v > 0 ? "+" : ""}${fx(v, d)}` : "—");
 const sgnPct = (v: number | null | undefined, d = 2) => (ok(v) ? `${sgn(v, d)}%` : "—");
@@ -88,8 +88,8 @@ function SetupPanel({ info }: { info: NeuralInfo | null }) {
             <pre>py -3.12 -m venv .venv; .venv\Scripts\activate{"\n"}pip install torch --index-url https://download.pytorch.org/whl/cu130{"\n"}pip install -r backend\requirements-train.txt</pre>
             (needs a current NVIDIA driver; check with <code>python -c "import torch; print(torch.cuda.is_available())"</code>), then train — the GPU is used automatically:
             <pre>python research\neural_train.py --data C:\path\to\training-data-YYYYMMDD.zip --fetch-fundamentals</pre></li>
-          <li><b>Upload</b> the files it prints — <code>model.onnx</code> + <code>model.json</code> (daily) and <code>intraday.onnx</code> + <code>intraday.json</code> (09:30) — to the server's <code>~/tradedesk/data/neural/</code> folder
-            (browser SSH: <i>Upload file</i>, then <code>sudo mv ~/model.* ~/intraday.* ~/tradedesk/data/neural/</code>). This desk loads them within a minute, the 09:30 picks start the next morning; no restart.</li>
+          <li><b>Upload</b> the files it prints — <code>model.onnx</code> + <code>model.json</code> (daily) and <code>intraday.onnx</code> + <code>intraday.json</code> (09:30, plus <code>intraday-gbm.json</code> when the trees won) — to the server's <code>~/tradedesk/data/neural/</code> folder
+            (browser SSH: <i>Upload file</i>, then <code>sudo mv ~/model.* ~/intraday* ~/tradedesk/data/neural/</code>). This desk loads them within a minute, the 09:30 picks start the next morning; no restart.</li>
         </ol>
         <p className="nn-note">More training time buys steadier networks, not a better backtest: <code>--search 16 --seeds 10</code> runs overnight and tries 16 network settings inside every training window (never on the test data).
           Retrain every few weeks, or after new results seasons: the networks then also learn from the headlines and 1-minute days recorded since.</p>
@@ -347,7 +347,7 @@ function IntradayPicksPanel({ model, onPick }: { model: NeuralIntradayInfo | nul
             <span className="kv"><span>Universe</span><span className={cls(u.universe_avg)}>{pct(u.universe_avg)}</span></span>
           </div>
         )}
-        <p className="nn-note">{nn.n} stocks scored{nn.skipped ? ` · ${nn.skipped} skipped (daily history a day behind, or a split/bonus)` : ""}. {nn.verdict}. Same stop/target rules as the TOP5. Data only — no orders are placed.</p>
+        <p className="nn-note">{nn.n} stocks scored{nn.uses ? ` by ${MODEL_NAME[nn.uses] ?? nn.uses}` : ""}{nn.skipped ? ` · ${nn.skipped} skipped (daily history a day behind, or a split/bonus)` : ""}. {nn.verdict}. Same stop/target rules as the TOP5. Data only — no orders are placed.</p>
       </>
     );
   }
@@ -370,7 +370,8 @@ function IntradayQualityPanel({ info, error }: { info: NeuralIntradayInfo | null
   }, []);
   const now = Date.now() / 1000;
   const beat = info?.heads?.find((h) => h.head === "beat")?.metrics ?? {};
-  const models = ["neural", "ranker", "linear", "gbm"].filter((k) => info?.trading?.[k]);
+  const models = ["neural", "ranker", "linear", "gbm", "blend", "selected"].filter((k) => info?.trading?.[k]);
+  const dep = info?.deploy;
   return (
     <Panel code="OOS" title="09:30 model — report card" area="iq" sub="walk-forward vs the live TOP5 ranker on the same days, 09:30 → close, net of costs">
       {error ? <ErrorNote error={error} /> : !info ? <Empty>Loading…</Empty>
@@ -402,6 +403,13 @@ function IntradayQualityPanel({ info, error }: { info: NeuralIntradayInfo | null
                 </tbody>
               </table></div>
               <p className="nn-note"><b>{info.verdict}</b>{info.edge_note ? <> — {info.edge_note}</> : null}</p>
+              {dep && (
+                <p className="nn-note">
+                  Picks come from <b>{MODEL_NAME[dep.model] ?? dep.model}</b>.
+                  {dep.selection.length > 0 && <> Chosen walked forward — each test fold was scored by the model that did best on the folds before it
+                    ({dep.selection.map((s) => `fold ${s.fold}: ${MODEL_NAME[s.chosen] ?? s.chosen}`).join(" · ")}); the edge is judged on that record, not on the winner's own.</>}
+                </p>
+              )}
               <Stats min={110}>
                 <Stat label="Stock-days" value={fx(info.rows ?? null, 0)} sub={`${info.days} days · ${info.symbols} stocks`} />
                 <Stat label="Tested" value={info.evaluation ? `${info.evaluation.folds.length} folds` : "—"} sub={info.evaluation ? `${info.evaluation.test_start} → ${info.evaluation.test_end}` : ""} />

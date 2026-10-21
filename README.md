@@ -285,9 +285,13 @@ previous close, volume vs the usual volume of that minute, NIFTY's path), the li
 breadth, and overnight headlines. Its picks are the 5 stocks most likely to beat the day's median (long) and the 5
 least likely (short), ≤ 2 per sector, liquid only, with the TOP5's stop/target rules. It is tested on the same days
 against **the live TOP5 ranker** (its real picks: eligibility, filters, abstaining), a logistic regression on the
-same inputs and gradient-boosted trees: AUC, rank IC, and the picks' returns 09:30 → close net of 0.06 % costs. It
-counts as having an edge only if the IC test passes **and** its long/short return is positive with t ≥ 2. Without an
-edge it makes no picks. With one, the analytics worker runs it at the lock (the daily context is built in a separate
+same inputs and gradient-boosted trees: AUC, rank IC, and the picks' returns 09:30 → close net of 0.06 % costs.
+**Best model wins:** the picks can come from the network, the trees or their average — whichever had the best
+long/short return on the *earlier* test folds scores each later fold, and that rule's own record ("selected" in the
+report) is what the edge test judges, so choosing the winner after seeing the results cannot flatter it. The rule
+with every fold seen decides what is deployed; the trees then travel as `intraday-gbm.json` (evaluated with numpy
+on the server). It counts as having an edge only if the IC test passes **and** its long/short return is positive
+with t ≥ 2. Without an edge it makes no picks. With one, the analytics worker runs it at the lock (the daily context is built in a separate
 process before the open), tracks its picks live, and the daily scorecard records them next to the TOP5 — the NEURAL
 desk shows that live record (paired, same days) once it exists. Not inputs: the ranker's OI, news-catalyst and
 order-book factors, which the history doesn't have.
@@ -318,13 +322,13 @@ order-book factors, which the history doesn't have.
    python research\neural_train.py --data C:\path\to\training-data-20261021.zip --fetch-fundamentals
    ```
    It prints both report cards and writes `model.onnx` + `model.json` (daily) and `intraday.onnx` +
-   `intraday.json` (09:30) next to the data. Options: `--model daily|intraday|both`, `--seeds 5` (networks
+   `intraday.json` (09:30, plus `intraday-gbm.json` when the trees were chosen) next to the data. Options: `--model daily|intraday|both`, `--seeds 5` (networks
    averaged), `--search 0` (network settings tried per training window), `--epochs 15`, `--no-gbm`, `--device cpu`.
    **Unlimited time?** `--search 16 --seeds 10` runs overnight: every training window tries 16 network sizes /
    dropout / learning-rate settings and picks one on its own validation slice — never on the test data — and the
    choice per fold is recorded. That buys steadier networks, not a better backtest.
 4. Upload the files to the server (browser SSH → *Upload file*), then
-   `sudo mv ~/model.* ~/intraday.* ~/tradedesk/data/neural/`. The desk loads them within a minute — no restart —
+   `sudo mv ~/model.* ~/intraday* ~/tradedesk/data/neural/`. The desk loads them within a minute — no restart —
    and the 09:30 picks start the next trading morning; fundamentals the server's cache lacks are fetched politely in
    the background.
 
