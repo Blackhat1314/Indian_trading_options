@@ -6,6 +6,10 @@ import type {
   AlertFire, ChainSnap, Clock, FnoSnap, Instrument, Market, NewsItem, RankSnap, SwingSnap, TopSnap,
 } from "./types";
 
+export type Mode = "pro" | "basic";
+export type BasicTab = "home" | "ideas" | "stock" | "practice" | "learn";
+const BASIC_TABS: BasicTab[] = ["home", "ideas", "stock", "practice", "learn"];
+
 export type DeskId = "intraday" | "market" | "fno" | "swing" | "news" | "alerts" | "geo" | "ai" | "screener" | "montecarlo" | "quant" | "neural" | "paper";
 const DESK_IDS: DeskId[] = ["intraday", "market", "fno", "swing", "news", "alerts", "geo", "ai", "screener", "montecarlo", "quant", "neural", "paper"];
 
@@ -21,6 +25,9 @@ export interface LiveState {
   user: string;
   source: string;
   desk: DeskId;
+  mode: Mode;                    // "basic" = the simplified view for beginners, "pro" = the terminal
+  basicTab: BasicTab;
+  basicScan: string;             // the Ideas scan open in Basic mode
   selected: string;              // selected symbol (equity)
   researchSymbol: string;        // the stock the research desks (AI, SCREENER, MONTE CARLO, QUANT) are on — any NSE stock
   chainName: string;
@@ -42,6 +49,10 @@ export interface LiveState {
   helpOpen: boolean;
   me: Me | null;
   setDesk: (d: DeskId) => void;
+  setMode: (m: Mode) => void;
+  setBasicTab: (t: BasicTab) => void;
+  setBasicScan: (id: string) => void;
+  openStock: (symbol: string) => void;     // Basic mode: the stock page for any NSE stock
   setMe: (m: Me) => void;
   select: (s: string) => void;
   setResearchSymbol: (s: string) => void;
@@ -64,6 +75,9 @@ export const useLive = create<LiveState>((set, get) => ({
   user: "",
   source: "",
   desk: DESK_IDS.includes(getPref("td.desk") as DeskId) ? (getPref("td.desk") as DeskId) : "intraday",  // SYSTEM moved to /admin
+  mode: getPref("td.mode") === "basic" ? "basic" : "pro",
+  basicTab: BASIC_TABS.includes(getPref("td.btab") as BasicTab) ? (getPref("td.btab") as BasicTab) : "home",
+  basicScan: getPref("td.bscan") || "breakout",
   selected: getPref("td.sel") || "",
   researchSymbol: getPref("td.rsym") || getPref("td.sel") || "RELIANCE",
   chainName: getPref("td.chain") || "NIFTY",
@@ -85,6 +99,23 @@ export const useLive = create<LiveState>((set, get) => ({
   helpOpen: false,
   me: null,
   setMe: (m) => set({ me: m }),
+  setMode: (m) => {
+    setPref("td.mode", m);
+    set({ mode: m });
+  },
+  setBasicTab: (t) => {
+    setPref("td.btab", t);
+    set({ basicTab: t });
+  },
+  setBasicScan: (id) => {
+    setPref("td.bscan", id);
+    set({ basicScan: id });
+  },
+  openStock: (symbol) => {
+    setPref("td.rsym", symbol);
+    setPref("td.btab", "stock");
+    set({ researchSymbol: symbol, basicTab: "stock" });
+  },
   setDesk: (d) => {
     setPref("td.desk", d);
     set({ desk: d, ...(d === "alerts" ? { unreadAlerts: 0 } : {}) });

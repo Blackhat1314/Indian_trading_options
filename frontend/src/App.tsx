@@ -21,6 +21,7 @@ const MonteCarlo = lazy(() => import("./desks/MonteCarlo"));
 const Quant = lazy(() => import("./desks/Quant"));
 const Neural = lazy(() => import("./desks/Neural"));
 const Paper = lazy(() => import("./desks/Paper"));
+const BasicApp = lazy(() => import("./basic/BasicApp"));
 
 const BASE_TOPICS = ["clock", "market", "top", "quotes", "geo:risk"];
 const DESK_TOPICS: Record<DeskId, string[]> = {
@@ -38,9 +39,11 @@ const DESK_TOPICS: Record<DeskId, string[]> = {
   neural: [],
   paper: ["paper"], // public signals snapshot; the account itself is polled over REST (per user)
 };
+const BASIC_TOPICS = ["rank", "fno", "swing"];   // Basic mode's ideas and stock pages read these
 
 export default function App() {
   const desk = useLive((s) => s.desk);
+  const mode = useLive((s) => s.mode);
   const conn = useLive((s) => s.conn);
   const connError = useLive((s) => s.connError);
   const setUniverse = useLive((s) => s.setUniverse);
@@ -83,18 +86,26 @@ export default function App() {
   }, [authed, setUniverse]);
 
   useEffect(() => {
-    const want = DESK_TOPICS[desk];
+    const want = mode === "basic" ? BASIC_TOPICS : DESK_TOPICS[desk];
     live.sub(want);
-    const others = Object.entries(DESK_TOPICS).filter(([d]) => d !== desk).flatMap(([, t]) => t)
+    const others = [...Object.values(DESK_TOPICS).flat(), ...BASIC_TOPICS]
       .filter((t) => !want.includes(t) && !BASE_TOPICS.includes(t));
-    live.unsub(others);
-  }, [desk]);
+    live.unsub([...new Set(others)]);
+  }, [desk, mode]);
 
   if (!authed) {
     return (
       <main className="login-page" aria-busy="true">
         <p className="small muted" role="status">{slow ? "Connecting to the gateway…" : ""}</p>
       </main>
+    );
+  }
+
+  if (mode === "basic") {
+    return (
+      <Suspense fallback={<main className="login-page" aria-busy="true" />}>
+        <BasicApp />
+      </Suspense>
     );
   }
 
