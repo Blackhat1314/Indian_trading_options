@@ -191,6 +191,8 @@ export function TopBar() {
           <span className={`dot ${conn === "open" ? "on" : conn === "connecting" ? "wait" : "off"}`} />
           <span>{conn === "open" ? (latency !== null ? `${latency}ms` : "LIVE") : conn.toUpperCase()}</span>
         </span>
+        <button type="button" className="btn mode-btn" onClick={() => useLive.getState().setMode("basic")}
+          title="A simpler view: plain words, today's ideas and one page per stock">BASIC VIEW</button>
         <UserMenu />
         <button type="button" className="btn icon-btn ghost" onClick={() => setHelp(true)} aria-label="Help and shortcuts"><Icon name="help" /></button>
       </div>

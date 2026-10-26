@@ -196,6 +196,24 @@ separate admin page (`/admin`): USERS, HISTORY and SYSTEM.
   `X-Forwarded-Host`), `X-Forwarded-For` and `X-Forwarded-Proto`, and use `ADMIN_USER`/`ADMIN_PASSWORD` for the first
   admin. The setup screen is switched off for requests that come through a proxy.
 
+## Basic view: a simple screen for beginners
+
+Click **BASIC VIEW** in the top bar (and **Pro view** to come back). The choice is remembered per browser. Basic
+is a light, plain-English layout over the same live data, with nothing to configure. It is built for phones too: on a
+small screen the five sections move to a bottom tab bar, buttons are finger-sized, and nothing scrolls sideways
+(checked down to 320px wide):
+
+* **Home**: the market in one sentence (breadth, sectors, the VIX as a "fear gauge"), today's five 09:30 picks
+  with their reasons in words and their track record, the biggest movers, and the neural model's month
+  leaders when its tests found an edge.
+* **Ideas**: ready-made filters (breaking out, volume rocketing, beating the market, gap up holding, futures
+  build-ups, and the swing setups with their historical record). Each one is a card; tap it to see the stocks.
+* **Stock**: price chart, a 0–100 business-quality score, the trend in words, what the model thinks (or "no
+  reliable view"), key numbers with explanations, and a **How many shares?** calculator that sizes a trade
+  from your capital, risk per trade and stop-loss.
+* **Practice**: the paper-trading books with a Start/Pause button. Virtual money only; no orders are placed.
+* **Learn**: five risk rules, how to read the app, and a searchable glossary.
+
 ## Research desks: AI analyst, Screener, Monte Carlo, Quant
 
 Four desks for researching any NSE stock (type a name or symbol in the box at the top of each; all four follow
