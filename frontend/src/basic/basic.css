@@ -1,6 +1,8 @@
 /* BASIC mode — a light, calm, roomy look for beginners (the PRO terminal keeps its dark tokens).
    Everything is scoped under .basic so the two views never style each other. */
 html.basic-root, html.basic-root body { background: #f5f6f8; }
+/* Basic scrolls the page itself (not an inner box): phones then collapse the address bar and keep native momentum */
+html.basic-root #root { height: auto; min-height: 100%; }
 .basic {
   --b-bg: #f5f6f8; --b-surface: #ffffff; --b-line: #e4e7ec; --b-line-2: #eff1f4;
   --b-text: #111827; --b-text-2: #344054; --b-muted: #667085;
@@ -8,7 +10,7 @@ html.basic-root, html.basic-root body { background: #f5f6f8; }
   --b-up: #10805a; --b-up-bg: #e7f6ef; --b-down: #c8292f; --b-down-bg: #fdecec; --b-warn: #a8580a; --b-warn-bg: #fff6e6;
   --b-r: 12px; --b-r-sm: 8px;
   color-scheme: light;
-  height: 100%; overflow-y: auto; background: var(--b-bg); color: var(--b-text);
+  min-height: 100%; background: var(--b-bg); color: var(--b-text);
   font-family: var(--font-ui); font-size: 14px; line-height: 1.5; font-variant-numeric: tabular-nums;
 }
 .basic :focus-visible { outline: 2px solid var(--b-accent); outline-offset: 2px; }
@@ -45,6 +47,7 @@ html.basic-root, html.basic-root body { background: #f5f6f8; }
 .b-nav button { position: relative; padding: 10px 12px 11px; border: 0; background: none; color: var(--b-muted); font-weight: 500; font-size: 14px; white-space: nowrap; }
 .b-nav button:hover { color: var(--b-text); }
 .b-nav button.on { color: var(--b-accent); font-weight: 600; }
+.b-nav-icon { display: none; }
 .b-nav button.on::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--b-accent); }
 .b-banner { background: var(--b-warn-bg); color: var(--b-warn); text-align: center; padding: 6px 12px; font-size: 13px; }
 
@@ -239,4 +242,37 @@ html.basic-root, html.basic-root body { background: #f5f6f8; }
   .b-bars li { grid-template-columns: minmax(80px, 1fr) minmax(0, 1fr) 64px; }
   .b-parts li { grid-template-columns: 104px minmax(0, 1fr) 40px; }
 }
+@media (max-width: 640px) {
+  /* a card's control (movers switch, glossary search) drops under the title when it doesn't fit */
+  .b-card-head { flex-wrap: wrap; }
+  .b-card-action { max-width: 100%; }
+}
+/* phones: the header scrolls away and the five sections move to a bottom tab bar, within thumb reach */
+@media (max-width: 640px) {
+  .basic { padding-bottom: calc(60px + env(safe-area-inset-bottom)); }
+  .b-top { position: static; backdrop-filter: none; background: #fff; }
+  .b-top-row { padding-bottom: 12px; }
+  .b-results { scroll-margin-top: 12px; }
+  .b-nav { position: fixed; z-index: 30; left: 0; right: 0; bottom: 0; max-width: none; margin: 0; padding: 0 0 env(safe-area-inset-bottom);
+    gap: 0; overflow: visible; background: #fff; border-top: 1px solid var(--b-line); box-shadow: 0 -2px 10px rgba(16, 24, 40, 0.05); }
+  .b-nav button { flex: 1; min-width: 0; height: 60px; padding: 6px 2px 4px; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 3px; font-size: 11.5px; }
+  .b-nav-icon { display: block; }
+  .b-nav button.on::after { top: 0; bottom: auto; left: 28%; right: 28%; height: 2.5px; }
+}
+@media (max-width: 400px) {
+  .b-brand-name { display: none; }
+  .b-btn { padding: 0 11px; }
+}
+/* touch screens: finger-sized targets, and 16px inputs so iOS doesn't zoom the page on focus */
+@media (pointer: coarse) {
+  .b-btn { height: 44px; }
+  .b-chip { height: 40px; }
+  .b-seg button { height: 38px; }
+  .b-nav button { padding-top: 13px; padding-bottom: 14px; }
+  @media (max-width: 640px) { .b-nav button { padding: 6px 2px 4px; } }
+  .basic input { font-size: 16px; }
+  .b-input, .b-search, .b-calc input { height: 44px; }
+}
+.b-foot { padding-bottom: max(24px, env(safe-area-inset-bottom)); }
 @media (prefers-reduced-motion: reduce) { .basic * { scroll-behavior: auto !important; } }

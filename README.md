@@ -199,7 +199,9 @@ separate admin page (`/admin`): USERS, HISTORY and SYSTEM.
 ## Basic view: a simple screen for beginners
 
 Click **BASIC VIEW** in the top bar (and **Pro view** to come back). The choice is remembered per browser. Basic
-is a light, plain-English layout over the same live data, with nothing to configure:
+is a light, plain-English layout over the same live data, with nothing to configure. It is built for phones too: on a
+small screen the five sections move to a bottom tab bar, buttons are finger-sized, and nothing scrolls sideways
+(checked down to 320px wide):
 
 * **Home**: the market in one sentence (breadth, sectors, the VIX as a "fear gauge"), today's five 09:30 picks
   with their reasons in words and their track record, the biggest movers, and the neural model's month

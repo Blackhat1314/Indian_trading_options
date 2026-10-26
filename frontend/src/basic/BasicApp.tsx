@@ -14,12 +14,13 @@ const StockPage = lazy(() => import("./StockPage"));
 const Practice = lazy(() => import("./Practice"));
 const Learn = lazy(() => import("./Learn"));
 
-const NAV: { id: BasicTab; label: string }[] = [
-  { id: "home", label: "Home" },
-  { id: "ideas", label: "Ideas" },
-  { id: "stock", label: "Stock" },
-  { id: "practice", label: "Practice" },
-  { id: "learn", label: "Learn" },
+// icons show only in the phone's bottom tab bar (24px grid, stroke icons)
+const NAV: { id: BasicTab; label: string; icon: string }[] = [
+  { id: "home", label: "Home", icon: "M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z" },
+  { id: "ideas", label: "Ideas", icon: "M9 18h6M10 21h4M12 3a6 6 0 0 0-3.6 10.8c.7.6 1.1 1.3 1.1 2.2h5c0-.9.4-1.6 1.1-2.2A6 6 0 0 0 12 3z" },
+  { id: "stock", label: "Stock", icon: "M4 19h16M5 15l4.5-5 3.5 3.5L19 7M15 7h4v4" },
+  { id: "practice", label: "Practice", icon: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 12h.01" },
+  { id: "learn", label: "Learn", icon: "M4 5.5A1.5 1.5 0 0 1 5.5 4H11v16H5.5A1.5 1.5 0 0 1 4 18.5zM20 5.5A1.5 1.5 0 0 0 18.5 4H13v16h5.5a1.5 1.5 0 0 0 1.5-1.5z" },
 ];
 
 const PHASE: Record<string, string> = {
@@ -96,13 +97,16 @@ export default function BasicApp() {
   const clock = useLive((s) => s.clock);
   const conn = useLive((s) => s.conn);
   const me = useLive((s) => s.me);
+  const sym = useLive((s) => s.researchSymbol);
   useEffect(() => { document.documentElement.classList.add("basic-root"); return () => document.documentElement.classList.remove("basic-root"); }, []);
+  // a new tab or stock starts at the top, like a new page
+  useEffect(() => { window.scrollTo({ top: 0 }); }, [tab, sym]);
   return (
     <div className="basic">
       <header className="b-top">
         <div className="b-top-row">
           <button type="button" className="b-brand" onClick={() => setTab("home")} aria-label="TradeDesk home">
-            <span className="b-brand-mark">TD</span><span>TradeDesk</span>
+            <span className="b-brand-mark">TD</span><span className="b-brand-name">TradeDesk</span>
           </button>
           <Search />
           <div className="b-top-right">
@@ -120,7 +124,11 @@ export default function BasicApp() {
         <nav className="b-nav" aria-label="Sections">
           {NAV.map((n) => (
             <button type="button" key={n.id} className={tab === n.id ? "on" : undefined} aria-current={tab === n.id ? "page" : undefined}
-              onClick={() => setTab(n.id)}>{n.label}</button>
+              onClick={() => setTab(n.id)}>
+              <svg className="b-nav-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+                strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={n.icon} /></svg>
+              <span>{n.label}</span>
+            </button>
           ))}
         </nav>
       </header>
